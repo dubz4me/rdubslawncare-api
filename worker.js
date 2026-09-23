@@ -205,6 +205,14 @@ export default {
         return jsonResponse({ user });
       }
 
+      // Public — the marketing website itself has no login at all, so this has to
+      // be readable without a token. Only GET is public; saving changes (below,
+      // past the login gate) still requires being logged in as the owner.
+      if (path === "/api/site-content" && request.method === "GET") {
+        const row = await db.prepare("SELECT content FROM site_content WHERE id = 1").first();
+        return jsonResponse({ content: row ? JSON.parse(row.content) : {} });
+      }
+
       // ================= EVERYTHING BELOW REQUIRES LOGIN =================
 
       const user = await getUserFromToken(db, getToken(request));
@@ -233,37 +241,47 @@ export default {
         const paymentStatus = user.role === "owner" ? (data.paymentStatus || "unpaid") : undefined;
         const paidAt = user.role === "owner" ? (data.paidAt || null) : undefined;
 
+        const existing = await db.prepare("SELECT status, total, lines, builder_state, completed_by FROM estimates WHERE timestamp = ?").bind(data.timestamp).first();
+
         // Once a job is agreed or completed, its price is locked for crew — they can
         // still update status, notes, or photos, but the total/pricing details fall
         // back to whatever is already stored, even if the request tried to change them.
         let total = data.total || 0;
         let lines = JSON.stringify(data.lines || []);
         let builderState = JSON.stringify(data.builderState || {});
-        if (user.role !== "owner") {
-          const existing = await db.prepare("SELECT status, total, lines, builder_state FROM estimates WHERE timestamp = ?").bind(data.timestamp).first();
-          if (existing && (existing.status === "confirmed" || existing.status === "completed")) {
-            total = existing.total;
-            lines = existing.lines;
-            builderState = existing.builder_state;
-          }
+        if (user.role !== "owner" && existing && (existing.status === "confirmed" || existing.status === "completed")) {
+          total = existing.total;
+          lines = existing.lines;
+          builderState = existing.builder_state;
+        }
+
+        // "Completed by" records whoever was actually logged in at the moment a job
+        // transitions to completed — set once, server-side (never client-supplied,
+        // so it can't be spoofed), and left alone on any later re-save of the same
+        // already-completed job (e.g. adding a photo afterward).
+        const newStatus = data.status || "pending";
+        let completedBy = existing ? existing.completed_by : null;
+        if (newStatus === "completed" && (!existing || existing.status !== "completed")) {
+          completedBy = user.username;
         }
 
         await db.prepare(`
-          INSERT INTO estimates (timestamp, customer_name, phone, address, is_recurring, total, lines, builder_state, status, payment_status, paid_at, has_photo, has_before_photo)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO estimates (timestamp, customer_name, phone, address, is_recurring, total, lines, builder_state, status, payment_status, paid_at, has_photo, has_before_photo, completed_by)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(timestamp) DO UPDATE SET
             customer_name = excluded.customer_name, phone = excluded.phone, address = excluded.address,
             is_recurring = excluded.is_recurring, total = excluded.total, lines = excluded.lines,
             builder_state = excluded.builder_state, status = excluded.status,
             payment_status = COALESCE(excluded.payment_status, estimates.payment_status),
             paid_at = COALESCE(excluded.paid_at, estimates.paid_at),
-            has_photo = excluded.has_photo, has_before_photo = excluded.has_before_photo
+            has_photo = excluded.has_photo, has_before_photo = excluded.has_before_photo,
+            completed_by = excluded.completed_by
         `).bind(
           data.timestamp, data.customerName || "", data.phone || "", data.address || "",
           data.isRecurring ? 1 : 0, total, lines,
-          builderState, data.status || "pending",
+          builderState, newStatus,
           paymentStatus ?? null, paidAt ?? null,
-          data.hasPhoto ? 1 : 0, data.hasBeforePhoto ? 1 : 0
+          data.hasPhoto ? 1 : 0, data.hasBeforePhoto ? 1 : 0, completedBy ?? null
         ).run();
         return jsonResponse({ success: true });
       }
@@ -320,17 +338,21 @@ export default {
       if (path === "/api/bookings" && request.method === "POST") {
         const data = await request.json();
         if (!data.id) return errorResponse("id is required.");
+        // Only the owner can assign or reassign who's doing a job — a crew member's
+        // write can't touch this field even if they send one.
+        const assignedTo = user.role === "owner" ? (data.assignedTo || null) : undefined;
         await db.prepare(`
-          INSERT INTO bookings (id, date_iso, slot_id, slot_label, start_ms, phone, customer_name, status, job_timestamp, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO bookings (id, date_iso, slot_id, slot_label, start_ms, phone, customer_name, status, job_timestamp, created_at, assigned_to)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(id) DO UPDATE SET
             date_iso = excluded.date_iso, slot_id = excluded.slot_id, slot_label = excluded.slot_label,
             start_ms = excluded.start_ms, phone = excluded.phone, customer_name = excluded.customer_name,
-            status = excluded.status, job_timestamp = excluded.job_timestamp
+            status = excluded.status, job_timestamp = excluded.job_timestamp,
+            assigned_to = COALESCE(excluded.assigned_to, bookings.assigned_to)
         `).bind(
           data.id, data.dateISO ?? null, data.slotId ?? null, data.slotLabel ?? null, data.startMs ?? null,
           data.phone || "", data.customerName || "", data.status || "accepted",
-          data.jobTimestamp || null, data.createdAt || Date.now()
+          data.jobTimestamp || null, data.createdAt || Date.now(), assignedTo ?? null
         ).run();
         return jsonResponse({ success: true });
       }
@@ -357,11 +379,11 @@ export default {
             if (m.newBooking) {
               const b = m.newBooking;
               await db.prepare(`
-                INSERT INTO bookings (id, date_iso, slot_id, slot_label, start_ms, phone, customer_name, status, job_timestamp, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO bookings (id, date_iso, slot_id, slot_label, start_ms, phone, customer_name, status, job_timestamp, created_at, assigned_to)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET date_iso=excluded.date_iso, slot_id=excluded.slot_id, slot_label=excluded.slot_label,
-                  start_ms=excluded.start_ms, phone=excluded.phone, customer_name=excluded.customer_name, status=excluded.status, job_timestamp=excluded.job_timestamp
-              `).bind(b.id, b.dateISO ?? null, b.slotId ?? null, b.slotLabel ?? null, b.startMs ?? null, b.phone || "", b.customerName || "", b.status || "accepted", b.jobTimestamp || null, b.createdAt || Date.now()).run();
+                  start_ms=excluded.start_ms, phone=excluded.phone, customer_name=excluded.customer_name, status=excluded.status, job_timestamp=excluded.job_timestamp, assigned_to=excluded.assigned_to
+              `).bind(b.id, b.dateISO ?? null, b.slotId ?? null, b.slotLabel ?? null, b.startMs ?? null, b.phone || "", b.customerName || "", b.status || "accepted", b.jobTimestamp || null, b.createdAt || Date.now(), b.assignedTo ?? null).run();
             }
             if (m.oldApptId) await db.prepare("DELETE FROM appointments WHERE id = ?").bind(m.oldApptId).run();
             if (m.newAppt) {
@@ -636,6 +658,45 @@ export default {
           ON CONFLICT(id) DO UPDATE SET template = excluded.template
         `).bind(JSON.stringify(data.template || {})).run();
         return jsonResponse({ success: true });
+      }
+
+      // ---- crew work schedules (everyone can view who's working when; owner-only to set) ----
+
+      if (path === "/api/crew-schedules" && request.method === "GET") {
+        const { results } = await db.prepare(`
+          SELECT u.username, u.name, u.role, cs.schedule
+          FROM users u LEFT JOIN crew_schedules cs ON cs.username = u.username
+          ORDER BY u.created_at ASC
+        `).all();
+        return jsonResponse({ schedules: results.map((r) => ({ username: r.username, name: r.name, role: r.role, schedule: JSON.parse(r.schedule || "{}") })) });
+      }
+
+      if (path.startsWith("/api/crew-schedules/") && request.method === "POST") {
+        if (user.role !== "owner") return errorResponse("Only the owner can set a crew member's work schedule.", 403);
+        const username = decodeURIComponent(path.split("/api/crew-schedules/")[1]);
+        const target = await db.prepare("SELECT id FROM users WHERE username = ?").bind(username).first();
+        if (!target) return errorResponse("No account with that username.", 404);
+        const data = await request.json();
+        await db.prepare(`
+          INSERT INTO crew_schedules (username, schedule) VALUES (?, ?)
+          ON CONFLICT(username) DO UPDATE SET schedule = excluded.schedule
+        `).bind(username, JSON.stringify(data.schedule || {})).run();
+        return jsonResponse({ success: true });
+      }
+
+      // ---- website content (public GET is above, before the login gate; saving is owner-only) ----
+
+      if (path === "/api/site-content" && request.method === "POST") {
+        if (user.role !== "owner") return errorResponse("Only the owner can edit the website.", 403);
+        const data = await request.json();
+        const existing = await db.prepare("SELECT content FROM site_content WHERE id = 1").first();
+        const current = existing ? JSON.parse(existing.content) : {};
+        const merged = { ...current, ...(data.content || {}) };
+        await db.prepare(`
+          INSERT INTO site_content (id, content) VALUES (1, ?)
+          ON CONFLICT(id) DO UPDATE SET content = excluded.content
+        `).bind(JSON.stringify(merged)).run();
+        return jsonResponse({ success: true, content: merged });
       }
 
       // ---- bug reports (anyone logged in can submit; only the owner can view/manage) ----
