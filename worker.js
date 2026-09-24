@@ -17,7 +17,7 @@
 // ------------------------------------------------------------------
 
 const SESSION_DURATION_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
-const OWNER_ONLY_PREFIXES = ["/api/expenses", "/api/inventory-items", "/api/time-logs"];
+const OWNER_ONLY_PREFIXES = ["/api/expenses", "/api/inventory-items"];
 
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -335,6 +335,22 @@ export default {
         const currentToken = getToken(request);
         await db.prepare("DELETE FROM sessions WHERE user_id = ? AND token <> ?").bind(user.id, currentToken).run();
         return jsonResponse({ success: true });
+      }
+
+      if (path.startsWith("/api/auth/users/") && path.endsWith("/role") && request.method === "POST") {
+        if (user.role !== "owner") return errorResponse("Owner access only.", 403);
+        const targetUsername = decodeURIComponent(path.split("/api/auth/users/")[1].replace(/\/role$/, ""));
+        if (targetUsername === user.username) return errorResponse("The owner role cannot be changed here.", 400);
+        const target = await db.prepare("SELECT id, username, role FROM users WHERE username = ?").bind(targetUsername).first();
+        if (!target) return errorResponse("No account with that username.", 404);
+        if (target.role === "owner") return errorResponse("The owner role cannot be changed.", 400);
+        const body = await request.json().catch(() => ({}));
+        const newRole = body.role === "manager" ? "manager" : body.role === "crew" ? "crew" : null;
+        if (!newRole) return errorResponse("Role must be crew or manager.", 400);
+        if (newRole === target.role) return jsonResponse({ success: true, role: newRole, changed: false });
+        await db.prepare("UPDATE users SET role = ? WHERE id = ?").bind(newRole, target.id).run();
+        await db.prepare("DELETE FROM sessions WHERE user_id = ?").bind(target.id).run();
+        return jsonResponse({ success: true, role: newRole, changed: true });
       }
 
       if (path.startsWith("/api/auth/users/") && path.endsWith("/reset-password") && request.method === "POST") {
@@ -883,6 +899,7 @@ export default {
       // ---- time_logs (Pattern B: owner-only, gate enforced above) ----
 
       if (path === "/api/time-logs" && request.method === "GET") {
+        if (user.role !== "owner") return errorResponse("Owner access only.", 403);
         const { results } = await db.prepare("SELECT * FROM time_logs ORDER BY timestamp DESC").all();
         return jsonResponse({ timeLogs: results });
       }
@@ -904,6 +921,7 @@ export default {
       }
 
       if (path.startsWith("/api/time-logs/") && request.method === "DELETE") {
+        if (user.role !== "owner") return errorResponse("Owner access only.", 403);
         const timestamp = path.split("/api/time-logs/")[1];
         await db.prepare("DELETE FROM time_logs WHERE timestamp = ?").bind(timestamp).run();
         return jsonResponse({ success: true });
