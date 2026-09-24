@@ -183,6 +183,75 @@ export default {
         return jsonResponse({ content });
       }
 
+
+      // ================= PUBLIC WEBSITE: 2027 INTEREST LIST =================
+      // No login required. Sends a lead only to R-DUB's verified destination.
+      if (path === "/api/quote" && request.method === "POST") {
+        const origin = request.headers.get("Origin") || "";
+        const allowedOrigins = new Set([
+          "https://rdubslawncare.com",
+          "https://www.rdubslawncare.com"
+        ]);
+        if (origin && !allowedOrigins.has(origin)) return errorResponse("Website origin not allowed.", 403);
+        if (!env.EMAIL || typeof env.EMAIL.send !== "function") return errorResponse("Email service is not configured.", 503);
+
+        const data = await request.json();
+        const clean = (value, max) => String(value ?? "").trim().slice(0, max);
+        const name = clean(data.name, 120);
+        const phone = clean(data.phone, 50);
+        const address = clean(data.address, 240);
+        const frequency = clean(data.frequency, 100);
+        const lot = clean(data.lot, 100);
+        const notes = clean(data.notes, 2000);
+        // Honeypot: real visitors never see/fill this field.
+        if (clean(data.website, 200)) return jsonResponse({ success: true });
+        if (!name || !phone || !address) return errorResponse("Name, phone, and property address are required.");
+
+        const submitted = new Date().toLocaleString("en-US", { timeZone: "America/Detroit", dateStyle: "full", timeStyle: "short" });
+        const subject = `2027 INTEREST LEAD — ${name} — ${frequency || "Lawn Care"}`;
+        const text = [
+          "R-DUB'S LAWN CARE — NEW 2027 INTEREST LEAD",
+          "",
+          `Customer: ${name}`,
+          `Phone: ${phone}`,
+          `Property: ${address}`,
+          `Interested in: ${frequency || "Not specified"}`,
+          `Approx. lot size: ${lot || "Not specified"}`,
+          "",
+          "PROPERTY NOTES",
+          notes || "None provided",
+          "",
+          `Submitted: ${submitted} ET`,
+          "",
+          "Interest request only — not a confirmed route reservation or service appointment."
+        ].join("\n");
+        const esc = (v) => String(v).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+        const html = `
+          <div style="font-family:Arial,sans-serif;max-width:680px;margin:auto;color:#17121c">
+            <div style="background:#17101e;border-top:6px solid #65ff32;padding:24px;color:#fff">
+              <div style="color:#65ff32;font-size:12px;font-weight:800;letter-spacing:1.5px">R-DUB'S LAWN CARE</div>
+              <h1 style="margin:8px 0 0;font-size:28px">New 2027 Interest Lead</h1>
+            </div>
+            <div style="padding:24px;border:1px solid #ddd;border-top:0">
+              <h2 style="margin-top:0">${esc(name)}</h2>
+              <p><strong>Phone:</strong> ${esc(phone)}<br><strong>Property:</strong> ${esc(address)}</p>
+              <p><strong>Interested in:</strong> ${esc(frequency || "Not specified")}<br><strong>Approx. lot size:</strong> ${esc(lot || "Not specified")}</p>
+              <div style="background:#f5f2f7;padding:16px;border-radius:10px"><strong>Property notes</strong><br>${esc(notes || "None provided").replace(/\n/g,"<br>")}</div>
+              <p style="font-size:12px;color:#666;margin-top:22px">Submitted ${esc(submitted)} ET<br>Interest request only — not a confirmed route reservation or service appointment.</p>
+            </div>
+          </div>`;
+
+        const result = await env.EMAIL.send({
+          to: "rdubslawncare@gmail.com",
+          from: "quote@rdubslawncare.com",
+          replyTo: "quote@rdubslawncare.com",
+          subject,
+          text,
+          html
+        });
+        return jsonResponse({ success: true, messageId: result && result.messageId ? result.messageId : null });
+      }
+
       // A forgot-password request does not reveal whether a username exists.
       if (path === "/api/auth/forgot-password" && request.method === "POST") {
         const body = await request.json();
