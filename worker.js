@@ -214,6 +214,99 @@ export default {
         return errorResponse("Owner access only.", 403);
       }
 
+      // ================= EMPLOYEE WORKDAY TIME CLOCK =================
+      // Separate from /api/time-logs, which measures individual job duration.
+      // Punch timestamps are generated here on the server, never accepted from the client.
+
+      if (path === "/api/time-clock/status" && request.method === "GET") {
+        const activeEntry = await db.prepare(
+          "SELECT * FROM employee_time_entries WHERE user_id = ? AND clock_out IS NULL ORDER BY clock_in DESC LIMIT 1"
+        ).bind(user.id).first();
+        const now = Date.now();
+        const requestedWeekStart = Number(url.searchParams.get("weekStart"));
+        const weekStart = Number.isFinite(requestedWeekStart) && requestedWeekStart > 0 ? requestedWeekStart : now - (7 * 24 * 60 * 60 * 1000);
+        const { results: weekEntries } = await db.prepare(
+          "SELECT clock_in, clock_out FROM employee_time_entries WHERE user_id = ? AND clock_in >= ? ORDER BY clock_in ASC"
+        ).bind(user.id, weekStart).all();
+        let weekMinutes = 0;
+        for (const e of weekEntries) weekMinutes += Math.max(0, Math.floor(((e.clock_out || now) - e.clock_in) / 60000));
+        return jsonResponse({ activeEntry, weekMinutes, weekStart });
+      }
+
+      if (path === "/api/time-clock/in" && request.method === "POST") {
+        const existing = await db.prepare(
+          "SELECT id FROM employee_time_entries WHERE user_id = ? AND clock_out IS NULL LIMIT 1"
+        ).bind(user.id).first();
+        if (existing) return errorResponse("You're already clocked in.", 409);
+        const now = Date.now();
+        const id = crypto.randomUUID();
+        await db.prepare(`
+          INSERT INTO employee_time_entries (id, user_id, username, employee_name, clock_in, clock_out, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
+        `).bind(id, user.id, user.username, user.name || user.username, now, now, now).run();
+        return jsonResponse({ success: true, id, clockIn: now });
+      }
+
+      if (path === "/api/time-clock/out" && request.method === "POST") {
+        const active = await db.prepare(
+          "SELECT * FROM employee_time_entries WHERE user_id = ? AND clock_out IS NULL ORDER BY clock_in DESC LIMIT 1"
+        ).bind(user.id).first();
+        if (!active) return errorResponse("You're not currently clocked in.", 409);
+        const now = Date.now();
+        if (now < active.clock_in) return errorResponse("Clock-out time is invalid.", 409);
+        await db.prepare("UPDATE employee_time_entries SET clock_out = ?, updated_at = ? WHERE id = ?")
+          .bind(now, now, active.id).run();
+        return jsonResponse({ success: true, id: active.id, clockOut: now });
+      }
+
+      if (path === "/api/time-clock/me" && request.method === "GET") {
+        const limit = Math.min(200, Math.max(1, Number(url.searchParams.get("limit")) || 50));
+        const { results } = await db.prepare(
+          "SELECT * FROM employee_time_entries WHERE user_id = ? ORDER BY clock_in DESC LIMIT ?"
+        ).bind(user.id, limit).all();
+        return jsonResponse({ entries: results });
+      }
+
+      if (path === "/api/time-clock/team" && request.method === "GET") {
+        if (user.role !== "owner") return errorResponse("Owner access only.", 403);
+        const limit = Math.min(500, Math.max(1, Number(url.searchParams.get("limit")) || 100));
+        const { results } = await db.prepare(
+          "SELECT * FROM employee_time_entries ORDER BY clock_in DESC LIMIT ?"
+        ).bind(limit).all();
+        const { results: active } = await db.prepare(
+          "SELECT * FROM employee_time_entries WHERE clock_out IS NULL ORDER BY clock_in ASC"
+        ).all();
+        return jsonResponse({ entries: results, active });
+      }
+
+      if (path === "/api/time-clock/admin/edit" && request.method === "POST") {
+        if (user.role !== "owner") return errorResponse("Owner access only.", 403);
+        const data = await request.json();
+        if (!data.id) return errorResponse("Entry id is required.");
+        if (!data.reason || !String(data.reason).trim()) return errorResponse("A correction reason is required.");
+        const before = await db.prepare("SELECT * FROM employee_time_entries WHERE id = ?").bind(data.id).first();
+        if (!before) return errorResponse("Time entry not found.", 404);
+        const clockIn = Number(data.clockIn ?? before.clock_in);
+        const clockOut = data.clockOut === null ? null : Number(data.clockOut ?? before.clock_out);
+        if (!Number.isFinite(clockIn) || (clockOut !== null && (!Number.isFinite(clockOut) || clockOut < clockIn))) {
+          return errorResponse("Corrected punch times are invalid.");
+        }
+        const now = Date.now();
+        await db.prepare(`UPDATE employee_time_entries SET clock_in = ?, clock_out = ?, updated_at = ?, edited_at = ?, edited_by = ?, edit_reason = ? WHERE id = ?`)
+          .bind(clockIn, clockOut, now, now, user.username, String(data.reason).trim(), data.id).run();
+        const after = await db.prepare("SELECT * FROM employee_time_entries WHERE id = ?").bind(data.id).first();
+        await db.prepare(`INSERT INTO employee_time_audit (id, entry_id, action, changed_by, changed_at, before_json, after_json, reason) VALUES (?, ?, 'edit', ?, ?, ?, ?, ?)`)
+          .bind(crypto.randomUUID(), data.id, user.username, now, JSON.stringify(before), JSON.stringify(after), String(data.reason).trim()).run();
+        return jsonResponse({ success: true, entry: after });
+      }
+
+      if (path.startsWith("/api/time-clock/audit/") && request.method === "GET") {
+        if (user.role !== "owner") return errorResponse("Owner access only.", 403);
+        const entryId = decodeURIComponent(path.split("/api/time-clock/audit/")[1]);
+        const { results } = await db.prepare("SELECT * FROM employee_time_audit WHERE entry_id = ? ORDER BY changed_at DESC").bind(entryId).all();
+        return jsonResponse({ audit: results });
+      }
+
       // ---- TEMPLATE PATTERN A: shared data, sensitive fields stripped ----
       // estimates/jobs are visible to everyone, but a crew member never
       // sees payment_status or paid_at on the way out.
