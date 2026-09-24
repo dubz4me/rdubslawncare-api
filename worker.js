@@ -77,6 +77,32 @@ async function getUserFromToken(db, token) {
   return user;
 }
 
+
+async function ensureRoleNotificationsTable(db) {
+  await db.prepare(`CREATE TABLE IF NOT EXISTS role_notifications (
+    id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    username TEXT NOT NULL,
+    old_role TEXT NOT NULL,
+    new_role TEXT NOT NULL,
+    changed_at INTEGER NOT NULL,
+    changed_by TEXT,
+    acknowledged_at INTEGER
+  )`).run();
+}
+
+async function getPendingRoleNotification(db, userId) {
+  try {
+    await ensureRoleNotificationsTable(db);
+    return await db.prepare(
+      "SELECT id, old_role, new_role, changed_at, changed_by FROM role_notifications WHERE user_id = ? AND acknowledged_at IS NULL ORDER BY changed_at DESC LIMIT 1"
+    ).bind(userId).first();
+  } catch (e) {
+    console.warn("[ROLE NOTICE] Could not load notification:", e.message);
+    return null;
+  }
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -295,7 +321,8 @@ export default {
         await db.prepare("INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)")
           .bind(token, user.id, Date.now(), Date.now() + SESSION_DURATION_MS).run();
 
-        return jsonResponse({ token, user: { username: user.username, role: user.role, name: user.name } });
+        const roleNotification = await getPendingRoleNotification(db, user.id);
+        return jsonResponse({ token, user: { username: user.username, role: user.role, name: user.name }, roleNotification });
       }
 
       if (path === "/api/auth/logout" && request.method === "POST") {
@@ -307,7 +334,8 @@ export default {
       if (path === "/api/auth/me" && request.method === "GET") {
         const user = await getUserFromToken(db, getToken(request));
         if (!user) return errorResponse("Not logged in.", 401);
-        return jsonResponse({ user });
+        const roleNotification = await getPendingRoleNotification(db, user.id);
+        return jsonResponse({ user, roleNotification });
       }
 
       // ================= EVERYTHING BELOW REQUIRES LOGIN =================
@@ -317,6 +345,19 @@ export default {
 
       if (OWNER_ONLY_PREFIXES.some((p) => path.startsWith(p)) && user.role !== "owner") {
         return errorResponse("Owner access only.", 403);
+      }
+
+      if (path === "/api/auth/role-notification/acknowledge" && request.method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        if (!body.id) return errorResponse("Notification id required.", 400);
+        try {
+          await ensureRoleNotificationsTable(db);
+          await db.prepare("UPDATE role_notifications SET acknowledged_at = ? WHERE id = ? AND user_id = ?")
+            .bind(Date.now(), body.id, user.id).run();
+        } catch (e) {
+          console.warn("[ROLE NOTICE] Could not acknowledge notification:", e.message);
+        }
+        return jsonResponse({ success: true });
       }
 
       // ================= ACCOUNT / TEAM SETTINGS =================
@@ -349,6 +390,15 @@ export default {
         if (!newRole) return errorResponse("Role must be crew or manager.", 400);
         if (newRole === target.role) return jsonResponse({ success: true, role: newRole, changed: false });
         await db.prepare("UPDATE users SET role = ? WHERE id = ?").bind(newRole, target.id).run();
+        try {
+          await ensureRoleNotificationsTable(db);
+          await db.prepare("UPDATE role_notifications SET acknowledged_at = ? WHERE user_id = ? AND acknowledged_at IS NULL")
+            .bind(Date.now(), target.id).run();
+          await db.prepare("INSERT INTO role_notifications (id, user_id, username, old_role, new_role, changed_at, changed_by, acknowledged_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)")
+            .bind(crypto.randomUUID(), target.id, target.username, target.role, newRole, Date.now(), user.username).run();
+        } catch (e) {
+          console.warn("[ROLE NOTICE] Role changed but notification could not be recorded:", e.message);
+        }
         await db.prepare("DELETE FROM sessions WHERE user_id = ?").bind(target.id).run();
         return jsonResponse({ success: true, role: newRole, changed: true });
       }
