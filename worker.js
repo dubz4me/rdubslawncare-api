@@ -121,9 +121,10 @@ export default {
         const user = await getUserFromToken(db, getToken(request));
         if (!user || user.role !== "owner") return errorResponse("Only the owner can add crew members.", 403);
 
-        const { username, password, name } = await request.json();
+        const { username, password, name, role } = await request.json();
         if (!username || !password) return errorResponse("Username and password required.");
         if (password.length < 8) return errorResponse("Password must be at least 8 characters.");
+        const accountRole = role === "manager" ? "manager" : "crew";
 
         const existing = await db.prepare("SELECT id FROM users WHERE username = ?").bind(username).first();
         if (existing) return errorResponse("That username is taken.");
@@ -131,10 +132,10 @@ export default {
         const salt = crypto.randomUUID();
         const hash = await hashPassword(password, salt);
         await db.prepare(
-          "INSERT INTO users (username, password_hash, role, name, created_at) VALUES (?, ?, 'crew', ?, ?)"
-        ).bind(username, `${salt}:${hash}`, name || username, Date.now()).run();
+          "INSERT INTO users (username, password_hash, role, name, created_at) VALUES (?, ?, ?, ?, ?)"
+        ).bind(username, `${salt}:${hash}`, accountRole, name || username, Date.now()).run();
 
-        return jsonResponse({ success: true, username, role: "crew" });
+        return jsonResponse({ success: true, username, role: accountRole });
       }
 
       if (path === "/api/auth/users" && request.method === "GET") {
@@ -172,6 +173,30 @@ export default {
         await db.prepare("DELETE FROM sessions WHERE user_id = ?").bind(target.id).run();
         await db.prepare("DELETE FROM users WHERE id = ?").bind(target.id).run();
         return jsonResponse({ success: true });
+      }
+
+      // Public website content is readable without a crew login. Owner edits are handled below.
+      if (path === "/api/site-content" && request.method === "GET") {
+        const { results } = await db.prepare("SELECT key, value FROM site_content ORDER BY key").all();
+        const content = {};
+        for (const row of results || []) content[row.key] = row.value;
+        return jsonResponse({ content });
+      }
+
+      // A forgot-password request does not reveal whether a username exists.
+      if (path === "/api/auth/forgot-password" && request.method === "POST") {
+        const body = await request.json();
+        const username = String(body.username || "").trim();
+        if (!username) return errorResponse("Enter your username.");
+        const target = await db.prepare("SELECT id, username FROM users WHERE username = ? AND disabled = 0").bind(username).first();
+        if (target) {
+          const existing = await db.prepare("SELECT id FROM password_reset_requests WHERE user_id = ? AND status = 'pending' LIMIT 1").bind(target.id).first();
+          if (!existing) {
+            await db.prepare("INSERT INTO password_reset_requests (id, user_id, username, requested_at, status) VALUES (?, ?, ?, ?, 'pending')")
+              .bind(crypto.randomUUID(), target.id, target.username, Date.now()).run();
+          }
+        }
+        return jsonResponse({ success: true, message: "If that account exists, the owner will see the reset request." });
       }
 
       if (path === "/api/auth/login" && request.method === "POST") {
@@ -212,6 +237,86 @@ export default {
 
       if (OWNER_ONLY_PREFIXES.some((p) => path.startsWith(p)) && user.role !== "owner") {
         return errorResponse("Owner access only.", 403);
+      }
+
+      // ================= ACCOUNT / TEAM SETTINGS =================
+      if (path === "/api/auth/change-password" && request.method === "POST") {
+        const { currentPassword, newPassword } = await request.json();
+        if (!currentPassword || !newPassword) return errorResponse("Current and new password are required.");
+        if (newPassword.length < 8) return errorResponse("New password must be at least 8 characters.");
+        const row = await db.prepare("SELECT password_hash FROM users WHERE id = ?").bind(user.id).first();
+        if (!row || !row.password_hash) return errorResponse("Account password could not be verified.", 400);
+        const [salt, expectedHash] = row.password_hash.split(":");
+        if (!(await verifyPassword(currentPassword, salt, expectedHash))) return errorResponse("Current password is incorrect.", 401);
+        const newSalt = crypto.randomUUID();
+        const newHash = await hashPassword(newPassword, newSalt);
+        await db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").bind(`${newSalt}:${newHash}`, user.id).run();
+        // Keep the current session, but invalidate every other logged-in device.
+        const currentToken = getToken(request);
+        await db.prepare("DELETE FROM sessions WHERE user_id = ? AND token <> ?").bind(user.id, currentToken).run();
+        return jsonResponse({ success: true });
+      }
+
+      if (path.startsWith("/api/auth/users/") && path.endsWith("/reset-password") && request.method === "POST") {
+        if (user.role !== "owner") return errorResponse("Owner access only.", 403);
+        const targetUsername = decodeURIComponent(path.split("/api/auth/users/")[1].replace(/\/reset-password$/, ""));
+        if (targetUsername === user.username) return errorResponse("Use Change Password for your own account.", 400);
+        const target = await db.prepare("SELECT id, role FROM users WHERE username = ?").bind(targetUsername).first();
+        if (!target) return errorResponse("No account with that username.", 404);
+        if (target.role === "owner") return errorResponse("The owner password cannot be reset here.", 400);
+        const { newPassword } = await request.json();
+        if (!newPassword || newPassword.length < 8) return errorResponse("New password must be at least 8 characters.");
+        const salt = crypto.randomUUID();
+        const hash = await hashPassword(newPassword, salt);
+        await db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").bind(`${salt}:${hash}`, target.id).run();
+        await db.prepare("DELETE FROM sessions WHERE user_id = ?").bind(target.id).run();
+        await db.prepare("UPDATE password_reset_requests SET status = 'resolved', resolved_at = ?, resolved_by = ? WHERE user_id = ? AND status = 'pending'")
+          .bind(Date.now(), user.username, target.id).run();
+        return jsonResponse({ success: true });
+      }
+
+      if (path === "/api/auth/password-reset-requests" && request.method === "GET") {
+        if (user.role !== "owner") return errorResponse("Owner access only.", 403);
+        const { results } = await db.prepare("SELECT id, username, requested_at, status FROM password_reset_requests WHERE status = 'pending' ORDER BY requested_at DESC").all();
+        return jsonResponse({ requests: results || [] });
+      }
+
+      if (path === "/api/crew-schedules" && request.method === "GET") {
+        const { results } = await db.prepare(
+          "SELECT u.username, u.name, u.role, cs.schedule_json FROM users u LEFT JOIN crew_schedules cs ON cs.user_id = u.id WHERE u.disabled = 0 ORDER BY CASE u.role WHEN 'owner' THEN 0 WHEN 'manager' THEN 1 ELSE 2 END, u.name, u.username"
+        ).all();
+        const schedules = (results || []).map((r) => ({ username: r.username, name: r.name, role: r.role, schedule: r.schedule_json || "{}" }));
+        return jsonResponse({ schedules });
+      }
+
+      if (path.startsWith("/api/crew-schedules/") && request.method === "POST") {
+        if (user.role !== "owner") return errorResponse("Owner access only.", 403);
+        const targetUsername = decodeURIComponent(path.split("/api/crew-schedules/")[1]);
+        const target = await db.prepare("SELECT id FROM users WHERE username = ?").bind(targetUsername).first();
+        if (!target) return errorResponse("No account with that username.", 404);
+        const { schedule } = await request.json();
+        if (!schedule || typeof schedule !== "object") return errorResponse("A schedule is required.");
+        const scheduleJson = JSON.stringify(schedule);
+        await db.prepare(
+          "INSERT INTO crew_schedules (user_id, username, schedule_json, updated_at, updated_by) VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET username = excluded.username, schedule_json = excluded.schedule_json, updated_at = excluded.updated_at, updated_by = excluded.updated_by"
+        ).bind(target.id, targetUsername, scheduleJson, Date.now(), user.username).run();
+        return jsonResponse({ success: true });
+      }
+
+      if (path === "/api/site-content" && request.method === "POST") {
+        if (user.role !== "owner") return errorResponse("Owner access only.", 403);
+        const body = await request.json();
+        if (!body.content || typeof body.content !== "object" || Array.isArray(body.content)) return errorResponse("Content is required.");
+        const entries = Object.entries(body.content);
+        for (const [key, value] of entries) {
+          if (!/^[A-Za-z0-9_-]{1,80}$/.test(key)) return errorResponse("Invalid content key.");
+          const stored = value == null ? "" : String(value);
+          if (stored.length > 10000) return errorResponse(`Content for ${key} is too long.`);
+          await db.prepare(
+            "INSERT INTO site_content (key, value, updated_at, updated_by) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at, updated_by = excluded.updated_by"
+          ).bind(key, stored, Date.now(), user.username).run();
+        }
+        return jsonResponse({ success: true });
       }
 
       // ================= EMPLOYEE WORKDAY TIME CLOCK =================
