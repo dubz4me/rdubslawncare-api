@@ -194,13 +194,8 @@ export default {
         ]);
         if (origin && !allowedOrigins.has(origin)) return errorResponse("Website origin not allowed.", 403);
         if (!env.EMAIL || typeof env.EMAIL.send !== "function") {
-          console.error("[QUOTE EMAIL DIAGNOSTIC] EMAIL binding unavailable", {
-            emailBindingPresent: Boolean(env.EMAIL),
-            emailBindingType: typeof env.EMAIL,
-            sendType: env.EMAIL ? typeof env.EMAIL.send : "missing",
-            availableBindings: Object.keys(env).sort()
-          });
-          return errorResponse("Email service is not configured.", 503);
+          console.error("[QUOTE EMAIL] EMAIL binding unavailable");
+          return errorResponse("Email service is temporarily unavailable. Please try again in a moment.", 503);
         }
 
         const data = await request.json();
@@ -263,12 +258,8 @@ export default {
           });
           return jsonResponse({ success: true, messageId: result && result.messageId ? result.messageId : null });
         } catch (emailError) {
-          console.error("[QUOTE EMAIL ERROR] Email Service rejected the message", {
-            name: emailError && emailError.name ? emailError.name : "Error",
-            message: emailError && emailError.message ? emailError.message : String(emailError),
-            stack: emailError && emailError.stack ? emailError.stack : undefined
-          });
-          return errorResponse("We could not send your request right now. Please call or text 269-579-4700, or try again in a moment.", 502);
+          console.error("[QUOTE EMAIL ERROR] Email Service rejected the message", emailError);
+          return errorResponse("We could not send your request right now. Please try again in a moment.", 502);
         }
       }
 
