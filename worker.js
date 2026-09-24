@@ -193,7 +193,15 @@ export default {
           "https://www.rdubslawncare.com"
         ]);
         if (origin && !allowedOrigins.has(origin)) return errorResponse("Website origin not allowed.", 403);
-        if (!env.EMAIL || typeof env.EMAIL.send !== "function") return errorResponse("Email service is not configured.", 503);
+        if (!env.EMAIL || typeof env.EMAIL.send !== "function") {
+          console.error("[QUOTE EMAIL DIAGNOSTIC] EMAIL binding unavailable", {
+            emailBindingPresent: Boolean(env.EMAIL),
+            emailBindingType: typeof env.EMAIL,
+            sendType: env.EMAIL ? typeof env.EMAIL.send : "missing",
+            availableBindings: Object.keys(env).sort()
+          });
+          return errorResponse("Email service is not configured.", 503);
+        }
 
         const data = await request.json();
         const clean = (value, max) => String(value ?? "").trim().slice(0, max);
@@ -241,15 +249,27 @@ export default {
             </div>
           </div>`;
 
-        const result = await env.EMAIL.send({
-          to: "rdubslawncare@gmail.com",
-          from: "quote@rdubslawncare.com",
-          replyTo: "quote@rdubslawncare.com",
-          subject,
-          text,
-          html
-        });
-        return jsonResponse({ success: true, messageId: result && result.messageId ? result.messageId : null });
+        try {
+          const result = await env.EMAIL.send({
+            to: "rdubslawncare@gmail.com",
+            from: "quote@rdubslawncare.com",
+            replyTo: "quote@rdubslawncare.com",
+            subject,
+            text,
+            html
+          });
+          console.log("[QUOTE EMAIL] 2027 interest lead sent successfully", {
+            messageId: result && result.messageId ? result.messageId : null
+          });
+          return jsonResponse({ success: true, messageId: result && result.messageId ? result.messageId : null });
+        } catch (emailError) {
+          console.error("[QUOTE EMAIL ERROR] Email Service rejected the message", {
+            name: emailError && emailError.name ? emailError.name : "Error",
+            message: emailError && emailError.message ? emailError.message : String(emailError),
+            stack: emailError && emailError.stack ? emailError.stack : undefined
+          });
+          return errorResponse("We could not send your request right now. Please call or text 269-579-4700, or try again in a moment.", 502);
+        }
       }
 
       // A forgot-password request does not reveal whether a username exists.
