@@ -119,12 +119,11 @@ export default {
       // team — the owner sets a temporary password and hands it over.)
       if (path === "/api/auth/invite" && request.method === "POST") {
         const user = await getUserFromToken(db, getToken(request));
-        if (!user || user.role !== "owner") return errorResponse("Only the owner can add team members.", 403);
+        if (!user || user.role !== "owner") return errorResponse("Only the owner can add crew members.", 403);
 
-        const { username, password, name, role } = await request.json();
+        const { username, password, name } = await request.json();
         if (!username || !password) return errorResponse("Username and password required.");
         if (password.length < 8) return errorResponse("Password must be at least 8 characters.");
-        const newRole = role === "manager" ? "manager" : "crew";
 
         const existing = await db.prepare("SELECT id FROM users WHERE username = ?").bind(username).first();
         if (existing) return errorResponse("That username is taken.");
@@ -132,10 +131,10 @@ export default {
         const salt = crypto.randomUUID();
         const hash = await hashPassword(password, salt);
         await db.prepare(
-          "INSERT INTO users (username, password_hash, role, name, created_at) VALUES (?, ?, ?, ?, ?)"
-        ).bind(username, `${salt}:${hash}`, newRole, name || username, Date.now()).run();
+          "INSERT INTO users (username, password_hash, role, name, created_at) VALUES (?, ?, 'crew', ?, ?)"
+        ).bind(username, `${salt}:${hash}`, name || username, Date.now()).run();
 
-        return jsonResponse({ success: true, username, role: newRole });
+        return jsonResponse({ success: true, username, role: "crew" });
       }
 
       if (path === "/api/auth/users" && request.method === "GET") {
@@ -206,30 +205,6 @@ export default {
         return jsonResponse({ user });
       }
 
-      // Public — the marketing website itself has no login at all, so this has to
-      // be readable without a token. Only GET is public; saving changes (below,
-      // past the login gate) still requires being logged in as the owner.
-      if (path === "/api/site-content" && request.method === "GET") {
-        const row = await db.prepare("SELECT content FROM site_content WHERE id = 1").first();
-        return jsonResponse({ content: row ? JSON.parse(row.content) : {} });
-      }
-
-      // Public, no-auth check of what's actually live — a quick way to confirm the
-      // right version of this file is deployed without fetching and diffing the
-      // whole source. Bump VERSION and the feature list any time real routes are
-      // added or changed here.
-      if (path === "/api/version" && request.method === "GET") {
-        return jsonResponse({
-          version: "2026-09-23-2",
-          features: [
-            "auth", "estimates", "bookings", "bookings-bulk-reschedule", "appointments",
-            "customer-profiles", "customers-change-phone", "expenses", "inventory-items",
-            "time-logs", "availability", "bug-reports", "crew-schedules", "site-content",
-            "deleted-customers", "auth-users-pause",
-          ],
-        });
-      }
-
       // ================= EVERYTHING BELOW REQUIRES LOGIN =================
 
       const user = await getUserFromToken(db, getToken(request));
@@ -237,45 +212,6 @@ export default {
 
       if (OWNER_ONLY_PREFIXES.some((p) => path.startsWith(p)) && user.role !== "owner") {
         return errorResponse("Owner access only.", 403);
-      }
-
-      // Self-service — any logged-in user (owner, manager, or crew) can change
-      // their own password, as long as they know their current one.
-      if (path === "/api/auth/change-password" && request.method === "POST") {
-        const data = await request.json();
-        if (!data.currentPassword || !data.newPassword) return errorResponse("Current and new password are required.");
-        if (data.newPassword.length < 8) return errorResponse("New password must be at least 8 characters.");
-
-        const fullUser = await db.prepare("SELECT password_hash FROM users WHERE id = ?").bind(user.id).first();
-        const [salt, expectedHash] = fullUser.password_hash.split(":");
-        const valid = await verifyPassword(data.currentPassword, salt, expectedHash);
-        if (!valid) return errorResponse("Current password is incorrect.", 401);
-
-        const newSalt = crypto.randomUUID();
-        const newHash = await hashPassword(data.newPassword, newSalt);
-        await db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").bind(`${newSalt}:${newHash}`, user.id).run();
-        return jsonResponse({ success: true });
-      }
-
-      // Owner-only — resets someone else's password when they're genuinely locked
-      // out (no email system exists here, so this is the real recovery path for
-      // a small team: they contact the owner, the owner resets it in Team Logins).
-      // Existing sessions for that account are cleared, so a stale login stops
-      // working the moment the password changes, not just on their next attempt.
-      if (path.startsWith("/api/auth/users/") && path.endsWith("/reset-password") && request.method === "POST") {
-        if (user.role !== "owner") return errorResponse("Only the owner can reset someone else's password.", 403);
-        const targetUsername = decodeURIComponent(path.split("/api/auth/users/")[1].replace(/\/reset-password$/, ""));
-        const data = await request.json();
-        if (!data.newPassword || data.newPassword.length < 8) return errorResponse("New password must be at least 8 characters.");
-
-        const target = await db.prepare("SELECT id, role FROM users WHERE username = ?").bind(targetUsername).first();
-        if (!target) return errorResponse("No account with that username.", 404);
-
-        const newSalt = crypto.randomUUID();
-        const newHash = await hashPassword(data.newPassword, newSalt);
-        await db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").bind(`${newSalt}:${newHash}`, target.id).run();
-        await db.prepare("DELETE FROM sessions WHERE user_id = ?").bind(target.id).run();
-        return jsonResponse({ success: true });
       }
 
       // ---- TEMPLATE PATTERN A: shared data, sensitive fields stripped ----
@@ -297,47 +233,37 @@ export default {
         const paymentStatus = user.role === "owner" ? (data.paymentStatus || "unpaid") : undefined;
         const paidAt = user.role === "owner" ? (data.paidAt || null) : undefined;
 
-        const existing = await db.prepare("SELECT status, total, lines, builder_state, completed_by FROM estimates WHERE timestamp = ?").bind(data.timestamp).first();
-
         // Once a job is agreed or completed, its price is locked for crew — they can
         // still update status, notes, or photos, but the total/pricing details fall
         // back to whatever is already stored, even if the request tried to change them.
         let total = data.total || 0;
         let lines = JSON.stringify(data.lines || []);
         let builderState = JSON.stringify(data.builderState || {});
-        if (user.role !== "owner" && user.role !== "manager" && existing && (existing.status === "confirmed" || existing.status === "completed")) {
-          total = existing.total;
-          lines = existing.lines;
-          builderState = existing.builder_state;
-        }
-
-        // "Completed by" records whoever was actually logged in at the moment a job
-        // transitions to completed — set once, server-side (never client-supplied,
-        // so it can't be spoofed), and left alone on any later re-save of the same
-        // already-completed job (e.g. adding a photo afterward).
-        const newStatus = data.status || "pending";
-        let completedBy = existing ? existing.completed_by : null;
-        if (newStatus === "completed" && (!existing || existing.status !== "completed")) {
-          completedBy = user.username;
+        if (user.role !== "owner") {
+          const existing = await db.prepare("SELECT status, total, lines, builder_state FROM estimates WHERE timestamp = ?").bind(data.timestamp).first();
+          if (existing && (existing.status === "confirmed" || existing.status === "completed")) {
+            total = existing.total;
+            lines = existing.lines;
+            builderState = existing.builder_state;
+          }
         }
 
         await db.prepare(`
-          INSERT INTO estimates (timestamp, customer_name, phone, address, is_recurring, total, lines, builder_state, status, payment_status, paid_at, has_photo, has_before_photo, completed_by)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO estimates (timestamp, customer_name, phone, address, is_recurring, total, lines, builder_state, status, payment_status, paid_at, has_photo, has_before_photo)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(timestamp) DO UPDATE SET
             customer_name = excluded.customer_name, phone = excluded.phone, address = excluded.address,
             is_recurring = excluded.is_recurring, total = excluded.total, lines = excluded.lines,
             builder_state = excluded.builder_state, status = excluded.status,
             payment_status = COALESCE(excluded.payment_status, estimates.payment_status),
             paid_at = COALESCE(excluded.paid_at, estimates.paid_at),
-            has_photo = excluded.has_photo, has_before_photo = excluded.has_before_photo,
-            completed_by = excluded.completed_by
+            has_photo = excluded.has_photo, has_before_photo = excluded.has_before_photo
         `).bind(
           data.timestamp, data.customerName || "", data.phone || "", data.address || "",
           data.isRecurring ? 1 : 0, total, lines,
-          builderState, newStatus,
+          builderState, data.status || "pending",
           paymentStatus ?? null, paidAt ?? null,
-          data.hasPhoto ? 1 : 0, data.hasBeforePhoto ? 1 : 0, completedBy ?? null
+          data.hasPhoto ? 1 : 0, data.hasBeforePhoto ? 1 : 0
         ).run();
         return jsonResponse({ success: true });
       }
@@ -348,7 +274,7 @@ export default {
       // per the anti-grief pass, since there's no legitimate crew need to
       // permanently delete a quote record rather than just declining it.
       if (path.startsWith("/api/estimates/") && request.method === "DELETE") {
-        if (user.role !== "owner" && user.role !== "manager") return errorResponse("Only the owner or a manager can delete a quote record.", 403);
+        if (user.role !== "owner") return errorResponse("Only the owner can delete a quote record.", 403);
         const id = decodeURIComponent(path.split("/api/estimates/")[1]);
         await db.prepare("DELETE FROM estimates WHERE timestamp = ?").bind(id).run();
         return jsonResponse({ success: true });
@@ -394,21 +320,17 @@ export default {
       if (path === "/api/bookings" && request.method === "POST") {
         const data = await request.json();
         if (!data.id) return errorResponse("id is required.");
-        // Only the owner can assign or reassign who's doing a job — a crew member's
-        // write can't touch this field even if they send one.
-        const assignedTo = user.role === "owner" ? (data.assignedTo || null) : undefined;
         await db.prepare(`
-          INSERT INTO bookings (id, date_iso, slot_id, slot_label, start_ms, phone, customer_name, status, job_timestamp, created_at, assigned_to)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO bookings (id, date_iso, slot_id, slot_label, start_ms, phone, customer_name, status, job_timestamp, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(id) DO UPDATE SET
             date_iso = excluded.date_iso, slot_id = excluded.slot_id, slot_label = excluded.slot_label,
             start_ms = excluded.start_ms, phone = excluded.phone, customer_name = excluded.customer_name,
-            status = excluded.status, job_timestamp = excluded.job_timestamp,
-            assigned_to = COALESCE(excluded.assigned_to, bookings.assigned_to)
+            status = excluded.status, job_timestamp = excluded.job_timestamp
         `).bind(
           data.id, data.dateISO ?? null, data.slotId ?? null, data.slotLabel ?? null, data.startMs ?? null,
           data.phone || "", data.customerName || "", data.status || "accepted",
-          data.jobTimestamp || null, data.createdAt || Date.now(), assignedTo ?? null
+          data.jobTimestamp || null, data.createdAt || Date.now()
         ).run();
         return jsonResponse({ success: true });
       }
@@ -425,7 +347,7 @@ export default {
       // their everyday single-booking cancellations (the generic endpoints above) stay
       // untouched.
       if (path === "/api/bookings/bulk-reschedule" && request.method === "POST") {
-        if (user.role !== "owner" && user.role !== "manager") return errorResponse("Only the owner or a manager can bulk-reschedule a day.", 403);
+        if (user.role !== "owner") return errorResponse("Only the owner can bulk-reschedule a day.", 403);
         const data = await request.json();
         const moves = Array.isArray(data.moves) ? data.moves : [];
         let applied = 0;
@@ -435,11 +357,11 @@ export default {
             if (m.newBooking) {
               const b = m.newBooking;
               await db.prepare(`
-                INSERT INTO bookings (id, date_iso, slot_id, slot_label, start_ms, phone, customer_name, status, job_timestamp, created_at, assigned_to)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO bookings (id, date_iso, slot_id, slot_label, start_ms, phone, customer_name, status, job_timestamp, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET date_iso=excluded.date_iso, slot_id=excluded.slot_id, slot_label=excluded.slot_label,
-                  start_ms=excluded.start_ms, phone=excluded.phone, customer_name=excluded.customer_name, status=excluded.status, job_timestamp=excluded.job_timestamp, assigned_to=excluded.assigned_to
-              `).bind(b.id, b.dateISO ?? null, b.slotId ?? null, b.slotLabel ?? null, b.startMs ?? null, b.phone || "", b.customerName || "", b.status || "accepted", b.jobTimestamp || null, b.createdAt || Date.now(), b.assignedTo ?? null).run();
+                  start_ms=excluded.start_ms, phone=excluded.phone, customer_name=excluded.customer_name, status=excluded.status, job_timestamp=excluded.job_timestamp
+              `).bind(b.id, b.dateISO ?? null, b.slotId ?? null, b.slotLabel ?? null, b.startMs ?? null, b.phone || "", b.customerName || "", b.status || "accepted", b.jobTimestamp || null, b.createdAt || Date.now()).run();
             }
             if (m.oldApptId) await db.prepare("DELETE FROM appointments WHERE id = ?").bind(m.oldApptId).run();
             if (m.newAppt) {
@@ -527,7 +449,7 @@ export default {
 
       if (path.startsWith("/api/customer-profiles/") && request.method === "DELETE") {
         const user = await getUserFromToken(db, getToken(request));
-        if (!user || (user.role !== "owner" && user.role !== "manager")) return errorResponse("Only the owner or a manager can delete a customer.", 403);
+        if (!user || user.role !== "owner") return errorResponse("Only the owner can delete a customer.", 403);
         const phone = decodeURIComponent(path.split("/api/customer-profiles/")[1]);
 
         const profile = await db.prepare("SELECT * FROM customer_profiles WHERE phone = ?").bind(phone).first();
@@ -554,14 +476,14 @@ export default {
 
       if (path === "/api/deleted-customers" && request.method === "GET") {
         const user = await getUserFromToken(db, getToken(request));
-        if (!user || (user.role !== "owner" && user.role !== "manager")) return errorResponse("Owner or manager access only.", 403);
+        if (!user || user.role !== "owner") return errorResponse("Owner access only.", 403);
         const { results } = await db.prepare("SELECT id, phone, deleted_by, deleted_by_role, deleted_at, restored, profile_snapshot FROM deleted_customers_log ORDER BY deleted_at DESC LIMIT 50").all();
         return jsonResponse({ deletedCustomers: results });
       }
 
       if (path.startsWith("/api/deleted-customers/") && path.endsWith("/restore") && request.method === "POST") {
         const user = await getUserFromToken(db, getToken(request));
-        if (!user || (user.role !== "owner" && user.role !== "manager")) return errorResponse("Owner or manager access only.", 403);
+        if (!user || user.role !== "owner") return errorResponse("Owner access only.", 403);
         const id = decodeURIComponent(path.split("/api/deleted-customers/")[1].replace(/\/restore$/, ""));
         const log = await db.prepare("SELECT * FROM deleted_customers_log WHERE id = ?").bind(id).first();
         if (!log) return errorResponse("No deletion record with that id.", 404);
@@ -603,7 +525,7 @@ export default {
 
       if (path.startsWith("/api/customers/") && path.endsWith("/change-phone") && request.method === "POST") {
         const user = await getUserFromToken(db, getToken(request));
-        if (!user || (user.role !== "owner" && user.role !== "manager")) return errorResponse("Only the owner or a manager can change a customer's phone number.", 403);
+        if (!user || user.role !== "owner") return errorResponse("Only the owner can change a customer's phone number.", 403);
         const oldPhone = decodeURIComponent(path.split("/api/customers/")[1].replace(/\/change-phone$/, ""));
         const data = await request.json();
         const newPhone = (data.newPhone || "").trim();
@@ -714,45 +636,6 @@ export default {
           ON CONFLICT(id) DO UPDATE SET template = excluded.template
         `).bind(JSON.stringify(data.template || {})).run();
         return jsonResponse({ success: true });
-      }
-
-      // ---- crew work schedules (everyone can view who's working when; owner-only to set) ----
-
-      if (path === "/api/crew-schedules" && request.method === "GET") {
-        const { results } = await db.prepare(`
-          SELECT u.username, u.name, u.role, cs.schedule
-          FROM users u LEFT JOIN crew_schedules cs ON cs.username = u.username
-          ORDER BY u.created_at ASC
-        `).all();
-        return jsonResponse({ schedules: results.map((r) => ({ username: r.username, name: r.name, role: r.role, schedule: JSON.parse(r.schedule || "{}") })) });
-      }
-
-      if (path.startsWith("/api/crew-schedules/") && request.method === "POST") {
-        if (user.role !== "owner") return errorResponse("Only the owner can set a crew member's work schedule.", 403);
-        const username = decodeURIComponent(path.split("/api/crew-schedules/")[1]);
-        const target = await db.prepare("SELECT id FROM users WHERE username = ?").bind(username).first();
-        if (!target) return errorResponse("No account with that username.", 404);
-        const data = await request.json();
-        await db.prepare(`
-          INSERT INTO crew_schedules (username, schedule) VALUES (?, ?)
-          ON CONFLICT(username) DO UPDATE SET schedule = excluded.schedule
-        `).bind(username, JSON.stringify(data.schedule || {})).run();
-        return jsonResponse({ success: true });
-      }
-
-      // ---- website content (public GET is above, before the login gate; saving is owner-only) ----
-
-      if (path === "/api/site-content" && request.method === "POST") {
-        if (user.role !== "owner") return errorResponse("Only the owner can edit the website.", 403);
-        const data = await request.json();
-        const existing = await db.prepare("SELECT content FROM site_content WHERE id = 1").first();
-        const current = existing ? JSON.parse(existing.content) : {};
-        const merged = { ...current, ...(data.content || {}) };
-        await db.prepare(`
-          INSERT INTO site_content (id, content) VALUES (1, ?)
-          ON CONFLICT(id) DO UPDATE SET content = excluded.content
-        `).bind(JSON.stringify(merged)).run();
-        return jsonResponse({ success: true, content: merged });
       }
 
       // ---- bug reports (anyone logged in can submit; only the owner can view/manage) ----
