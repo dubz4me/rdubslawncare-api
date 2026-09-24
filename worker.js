@@ -350,8 +350,18 @@ export default {
         const hash = await hashPassword(newPassword, salt);
         await db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").bind(`${salt}:${hash}`, target.id).run();
         await db.prepare("DELETE FROM sessions WHERE user_id = ?").bind(target.id).run();
-        await db.prepare("UPDATE password_reset_requests SET status = 'resolved', resolved_at = ?, resolved_by = ? WHERE user_id = ? AND status = 'pending'")
-          .bind(Date.now(), user.username, target.id).run();
+        // Password reset itself is complete at this point. Clearing sessions above
+        // forces the crew member to sign in again with the new password.
+        //
+        // Mark a pending reset request resolved when that tracking table/schema is
+        // available, but never turn an otherwise-successful password reset into a 500
+        // just because the optional request-history row is missing or from an older schema.
+        try {
+          await db.prepare("UPDATE password_reset_requests SET status = 'resolved', resolved_at = ?, resolved_by = ? WHERE user_id = ? AND status = 'pending'")
+            .bind(Date.now(), user.username, target.id).run();
+        } catch (resetTrackingError) {
+          console.warn("[PASSWORD RESET] Password changed, but reset-request tracking could not be updated:", resetTrackingError.message);
+        }
         return jsonResponse({ success: true });
       }
 
