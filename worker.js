@@ -103,6 +103,54 @@ async function getPendingRoleNotification(db, userId) {
   }
 }
 
+// ---- Photo checklists ----
+// A "shot list" is the ordered set of photos crew take at a property. There's one
+// default list (just "Front yard" to start) and the owner can give any customer
+// their own. Stored in photo_shot_lists with scope "default" or "customer:<phone>".
+const DEFAULT_SHOTS = [{ id: "front", label: "Front yard", tip: "Stand at the curb so the whole front lawn is in frame.", required: true }];
+
+async function getShotList(db, phone) {
+  if (phone) {
+    const c = await db.prepare("SELECT shots_json FROM photo_shot_lists WHERE scope = ?").bind(`customer:${phone}`).first();
+    if (c) return { shots: JSON.parse(c.shots_json), isCustom: true };
+  }
+  const d = await db.prepare("SELECT shots_json FROM photo_shot_lists WHERE scope = 'default'").first();
+  return { shots: d ? JSON.parse(d.shots_json) : DEFAULT_SHOTS, isCustom: false };
+}
+
+function cleanShots(input) {
+  if (!Array.isArray(input) || input.length < 1 || input.length > 12) return null;
+  const used = new Set();
+  const out = [];
+  for (const s of input) {
+    const label = String((s && s.label) || "").trim().slice(0, 40);
+    if (!label) return null;
+    let id = String((s && s.id) || label).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 30) || "shot";
+    const base = id;
+    let n = 2;
+    while (used.has(id)) id = `${base}-${n++}`;
+    used.add(id);
+    out.push({ id, label, tip: String((s && s.tip) || "").trim().slice(0, 120), required: !(s && s.required === false) });
+  }
+  return out;
+}
+
+// The job's photo flags come ONLY from what's actually stored: "before done" means
+// every required shot on that customer's checklist has a saved photo.
+async function recomputePhotoFlags(db, photos, ts) {
+  const job = await db.prepare("SELECT phone FROM estimates WHERE timestamp = ?").bind(ts).first();
+  if (!job) return;
+  const { shots } = await getShotList(db, job.phone);
+  const { results } = await db.prepare("SELECT phase, slot FROM job_photos WHERE job_ts = ?").bind(ts).all();
+  const before = new Set(results.filter((r) => r.phase === "before").map((r) => r.slot));
+  const required = shots.filter((s) => s.required);
+  let hasBefore = required.length ? required.every((s) => before.has(s.id)) : before.size > 0;
+  let hasAfter = results.some((r) => r.phase === "after");
+  if (!hasBefore && await photos.head(`jobs/${ts}/before.jpg`)) hasBefore = true; // older single-photo jobs
+  if (!hasAfter && await photos.head(`jobs/${ts}/after.jpg`)) hasAfter = true;
+  await db.prepare("UPDATE estimates SET has_before_photo = ?, has_photo = ? WHERE timestamp = ?").bind(hasBefore ? 1 : 0, hasAfter ? 1 : 0, ts).run();
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -336,6 +384,20 @@ export default {
         if (!user) return errorResponse("Not logged in.", 401);
         const roleNotification = await getPendingRoleNotification(db, user.id);
         return jsonResponse({ user, roleNotification });
+      }
+
+      // Public quick check of what's actually deployed — bump when routes change.
+      if (path === "/api/version" && request.method === "GET") {
+        return jsonResponse({
+          version: "2026-09-25-photo-checklists",
+          features: [
+            "auth", "estimates", "completed-by", "bookings", "job-assignment", "bookings-bulk-reschedule",
+            "appointments", "customer-profiles", "customers-change-phone", "expenses", "inventory-items",
+            "time-logs", "availability", "bug-reports", "crew-schedules", "site-content", "deleted-customers",
+            "auth-users-pause", "manager-role", "change-password", "reset-password", "forgot-password",
+            "role-notifications", "time-clock", "quote", "job-photos-r2", "photo-checklists",
+          ],
+        });
       }
 
       // ================= EVERYTHING BELOW REQUIRES LOGIN =================
@@ -593,8 +655,8 @@ export default {
         let total = data.total || 0;
         let lines = JSON.stringify(data.lines || []);
         let builderState = JSON.stringify(data.builderState || {});
-        if (user.role !== "owner") {
-          const existing = await db.prepare("SELECT status, total, lines, builder_state FROM estimates WHERE timestamp = ?").bind(data.timestamp).first();
+        const existing = await db.prepare("SELECT status, total, lines, builder_state, completed_by FROM estimates WHERE timestamp = ?").bind(data.timestamp).first();
+        if (user.role !== "owner" && user.role !== "manager") {
           if (existing && (existing.status === "confirmed" || existing.status === "completed")) {
             total = existing.total;
             lines = existing.lines;
@@ -602,24 +664,158 @@ export default {
           }
         }
 
+        // "Completed by" = whoever was logged in when the job flipped to completed.
+        // Server-side only (never client-supplied), and preserved on later re-saves.
+        const newStatus = data.status || "pending";
+        let completedBy = existing ? existing.completed_by : null;
+        if (newStatus === "completed" && (!existing || existing.status !== "completed")) completedBy = user.username;
+
         await db.prepare(`
-          INSERT INTO estimates (timestamp, customer_name, phone, address, is_recurring, total, lines, builder_state, status, payment_status, paid_at, has_photo, has_before_photo)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO estimates (timestamp, customer_name, phone, address, is_recurring, total, lines, builder_state, status, payment_status, paid_at, has_photo, has_before_photo, completed_by)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(timestamp) DO UPDATE SET
             customer_name = excluded.customer_name, phone = excluded.phone, address = excluded.address,
             is_recurring = excluded.is_recurring, total = excluded.total, lines = excluded.lines,
             builder_state = excluded.builder_state, status = excluded.status,
             payment_status = COALESCE(excluded.payment_status, estimates.payment_status),
             paid_at = COALESCE(excluded.paid_at, estimates.paid_at),
-            has_photo = excluded.has_photo, has_before_photo = excluded.has_before_photo
+            has_photo = estimates.has_photo, has_before_photo = estimates.has_before_photo,
+            completed_by = excluded.completed_by
         `).bind(
           data.timestamp, data.customerName || "", data.phone || "", data.address || "",
           data.isRecurring ? 1 : 0, total, lines,
-          builderState, data.status || "pending",
+          builderState, newStatus,
           paymentStatus ?? null, paidAt ?? null,
-          data.hasPhoto ? 1 : 0, data.hasBeforePhoto ? 1 : 0
+          0, 0, completedBy ?? null
         ).run();
         return jsonResponse({ success: true });
+      }
+
+      // ---- Photo checklist settings (everyone can read; only the owner edits) ----
+      const listMatch = path.match(/^\/api\/shot-lists\/(?:default|customer\/([^/]+))$/);
+      if (listMatch) {
+        const phone = listMatch[1] ? decodeURIComponent(listMatch[1]) : null;
+        const scope = phone ? `customer:${phone}` : "default";
+        if (request.method === "GET") return jsonResponse(await getShotList(db, phone));
+        if (user.role !== "owner") return errorResponse("Only the owner can change photo checklists.", 403);
+        if (request.method === "POST") {
+          const data = await request.json();
+          const shots = cleanShots(data.shots);
+          if (!shots) return errorResponse("A checklist needs 1–12 shots, and each one needs a name.");
+          await db.prepare(`
+            INSERT INTO photo_shot_lists (scope, shots_json, updated_at, updated_by) VALUES (?, ?, ?, ?)
+            ON CONFLICT(scope) DO UPDATE SET shots_json = excluded.shots_json, updated_at = excluded.updated_at, updated_by = excluded.updated_by
+          `).bind(scope, JSON.stringify(shots), Date.now(), user.username).run();
+          return jsonResponse({ success: true, shots });
+        }
+        if (request.method === "DELETE" && phone) {
+          await db.prepare("DELETE FROM photo_shot_lists WHERE scope = ?").bind(scope).run();
+          return jsonResponse({ success: true });
+        }
+      }
+
+      // ---- Checklist photos for a job: /api/jobs/:ts/photos[/:phase/:slot] ----
+      const jobPhotoMatch = path.match(/^\/api\/jobs\/(\d+)\/photos(?:\/(before|after|issue)\/([a-z0-9-]{1,40}))?$/);
+      if (jobPhotoMatch) {
+        if (!env.PHOTOS) return errorResponse("Photo storage isn't connected yet (missing PHOTOS binding).", 500);
+        const [, ts, phase, slot] = jobPhotoMatch;
+        const job = await db.prepare("SELECT phone FROM estimates WHERE timestamp = ?").bind(ts).first();
+        if (!job) return errorResponse("No job with that id.", 404);
+
+        if (!phase) {
+          if (request.method !== "GET") return errorResponse("Not found.", 404);
+          const list = await getShotList(db, job.phone);
+          const { results } = await db.prepare("SELECT phase, slot, label, note, uploaded_by, uploaded_at FROM job_photos WHERE job_ts = ? ORDER BY uploaded_at").bind(ts).all();
+          const legacy = { before: !!(await env.PHOTOS.head(`jobs/${ts}/before.jpg`)), after: !!(await env.PHOTOS.head(`jobs/${ts}/after.jpg`)) };
+          return jsonResponse({ ...list, photos: results, legacy });
+        }
+
+        const key = `jobs/${ts}/${phase}/${slot}.jpg`;
+        const existing = await db.prepare("SELECT uploaded_by FROM job_photos WHERE job_ts = ? AND phase = ? AND slot = ?").bind(ts, phase, slot).first();
+
+        if (request.method === "GET") {
+          const obj = await env.PHOTOS.get(key);
+          if (!obj) return errorResponse("Photo not found.", 404);
+          return new Response(obj.body, { headers: {
+            "Content-Type": (obj.httpMetadata && obj.httpMetadata.contentType) || "image/jpeg",
+            "Cache-Control": "private, max-age=3600",
+            "Access-Control-Allow-Origin": "*",
+          } });
+        }
+
+        if (request.method === "POST") {
+          // Before photos and flagged issues are accountability records: once saved,
+          // only the owner can replace them. After photos can be retaken by anyone.
+          if (phase !== "after" && existing && user.role !== "owner") {
+            return errorResponse(phase === "before" ? "That before photo is already saved. Only the owner can replace it." : "That issue photo is already saved.", 403);
+          }
+          const data = await request.json();
+          const m = /^data:(image\/(?:jpeg|png|webp));base64,(.+)$/.exec(data.dataUri || "");
+          if (!m) return errorResponse("Expected a JPEG, PNG, or WebP image.");
+          const bytes = Uint8Array.from(atob(m[2]), (c) => c.charCodeAt(0));
+          if (bytes.length > 5 * 1024 * 1024) return errorResponse("Photo is too large (5MB max).");
+          await env.PHOTOS.put(key, bytes, { httpMetadata: { contentType: m[1] }, customMetadata: { uploadedBy: user.username } });
+          await db.prepare(`
+            INSERT INTO job_photos (job_ts, phase, slot, label, note, r2_key, uploaded_by, uploaded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_ts, phase, slot) DO UPDATE SET label = excluded.label, note = excluded.note, uploaded_by = excluded.uploaded_by, uploaded_at = excluded.uploaded_at
+          `).bind(ts, phase, slot, String(data.label || slot).slice(0, 60), String(data.note || "").slice(0, 300), key, user.username, Date.now()).run();
+          await recomputePhotoFlags(db, env.PHOTOS, ts);
+          return jsonResponse({ success: true });
+        }
+
+        if (request.method === "DELETE") {
+          if (phase !== "after" && user.role !== "owner") return errorResponse("Only the owner can remove before photos or flagged issues.", 403);
+          await env.PHOTOS.delete(key);
+          await db.prepare("DELETE FROM job_photos WHERE job_ts = ? AND phase = ? AND slot = ?").bind(ts, phase, slot).run();
+          await recomputePhotoFlags(db, env.PHOTOS, ts);
+          return jsonResponse({ success: true });
+        }
+      }
+
+      // ---- Job photos (R2 bucket "rdubs-job-photos", bound as PHOTOS) ----
+      // The photo flags on a job are set ONLY here, after the image is actually
+      // stored — never by an ordinary job save — so "before photo taken" can't be
+      // true unless the photo really exists.
+      const photoMatch = path.match(/^\/api\/photos\/(\d+)\/(before|after)$/);
+      if (photoMatch) {
+        if (!env.PHOTOS) return errorResponse("Photo storage isn't connected yet (missing PHOTOS binding).", 500);
+        const [, ts, kind] = photoMatch;
+        const key = `jobs/${ts}/${kind}.jpg`;
+        const flagCol = kind === "before" ? "has_before_photo" : "has_photo";
+        const job = await db.prepare(`SELECT ${flagCol} AS flag FROM estimates WHERE timestamp = ?`).bind(ts).first();
+        if (!job) return errorResponse("No job with that id.", 404);
+
+        if (request.method === "GET") {
+          const obj = await env.PHOTOS.get(key);
+          if (!obj) return errorResponse("Photo not found.", 404);
+          return new Response(obj.body, { headers: {
+            "Content-Type": (obj.httpMetadata && obj.httpMetadata.contentType) || "image/jpeg",
+            "Cache-Control": "private, max-age=3600",
+            "Access-Control-Allow-Origin": "*",
+          } });
+        }
+
+        if (request.method === "POST") {
+          // Before-photos are accountability records: once one exists, only the owner can replace it.
+          if (kind === "before" && user.role !== "owner" && await env.PHOTOS.head(key)) {
+            return errorResponse("A before-service photo is already on file. Only the owner can replace it.", 403);
+          }
+          const data = await request.json();
+          const m = /^data:(image\/(?:jpeg|png|webp));base64,(.+)$/.exec(data.dataUri || "");
+          if (!m) return errorResponse("Expected a JPEG, PNG, or WebP image.");
+          const bytes = Uint8Array.from(atob(m[2]), (c) => c.charCodeAt(0));
+          if (bytes.length > 5 * 1024 * 1024) return errorResponse("Photo is too large (5MB max).");
+          await env.PHOTOS.put(key, bytes, { httpMetadata: { contentType: m[1] }, customMetadata: { uploadedBy: user.username, uploadedAt: String(Date.now()) } });
+          await db.prepare(`UPDATE estimates SET ${flagCol} = 1 WHERE timestamp = ?`).bind(ts).run();
+          return jsonResponse({ success: true });
+        }
+
+        if (request.method === "DELETE") {
+          if (kind === "before" && user.role !== "owner") return errorResponse("Only the owner can remove a before-service photo.", 403);
+          await env.PHOTOS.delete(key);
+          await db.prepare(`UPDATE estimates SET ${flagCol} = 0 WHERE timestamp = ?`).bind(ts).run();
+          return jsonResponse({ success: true });
+        }
       }
 
       // This was genuinely missing — estimate deletion (discarding a pending or
@@ -628,7 +824,7 @@ export default {
       // per the anti-grief pass, since there's no legitimate crew need to
       // permanently delete a quote record rather than just declining it.
       if (path.startsWith("/api/estimates/") && request.method === "DELETE") {
-        if (user.role !== "owner") return errorResponse("Only the owner can delete a quote record.", 403);
+        if (user.role !== "owner" && user.role !== "manager") return errorResponse("Only the owner or a manager can delete a quote record.", 403);
         const id = decodeURIComponent(path.split("/api/estimates/")[1]);
         await db.prepare("DELETE FROM estimates WHERE timestamp = ?").bind(id).run();
         return jsonResponse({ success: true });
@@ -674,17 +870,22 @@ export default {
       if (path === "/api/bookings" && request.method === "POST") {
         const data = await request.json();
         if (!data.id) return errorResponse("id is required.");
+        // Only the owner can assign/reassign who's doing a job; anyone else's write
+        // leaves the existing assignment untouched even if they send one.
+        const assignedTo = user.role === "owner" ? (data.assignedTo || null) : undefined;
         await db.prepare(`
-          INSERT INTO bookings (id, date_iso, slot_id, slot_label, start_ms, phone, customer_name, status, job_timestamp, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO bookings (id, date_iso, slot_id, slot_label, start_ms, phone, customer_name, status, job_timestamp, created_at, assigned_to)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(id) DO UPDATE SET
             date_iso = excluded.date_iso, slot_id = excluded.slot_id, slot_label = excluded.slot_label,
             start_ms = excluded.start_ms, phone = excluded.phone, customer_name = excluded.customer_name,
-            status = excluded.status, job_timestamp = excluded.job_timestamp
+            status = excluded.status, job_timestamp = excluded.job_timestamp,
+            assigned_to = CASE WHEN ? = 1 THEN excluded.assigned_to ELSE bookings.assigned_to END
         `).bind(
           data.id, data.dateISO ?? null, data.slotId ?? null, data.slotLabel ?? null, data.startMs ?? null,
           data.phone || "", data.customerName || "", data.status || "accepted",
-          data.jobTimestamp || null, data.createdAt || Date.now()
+          data.jobTimestamp || null, data.createdAt || Date.now(), assignedTo ?? null,
+          user.role === "owner" ? 1 : 0
         ).run();
         return jsonResponse({ success: true });
       }
@@ -701,7 +902,7 @@ export default {
       // their everyday single-booking cancellations (the generic endpoints above) stay
       // untouched.
       if (path === "/api/bookings/bulk-reschedule" && request.method === "POST") {
-        if (user.role !== "owner") return errorResponse("Only the owner can bulk-reschedule a day.", 403);
+        if (user.role !== "owner" && user.role !== "manager") return errorResponse("Only the owner or a manager can bulk-reschedule a day.", 403);
         const data = await request.json();
         const moves = Array.isArray(data.moves) ? data.moves : [];
         let applied = 0;
@@ -711,11 +912,11 @@ export default {
             if (m.newBooking) {
               const b = m.newBooking;
               await db.prepare(`
-                INSERT INTO bookings (id, date_iso, slot_id, slot_label, start_ms, phone, customer_name, status, job_timestamp, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO bookings (id, date_iso, slot_id, slot_label, start_ms, phone, customer_name, status, job_timestamp, created_at, assigned_to)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET date_iso=excluded.date_iso, slot_id=excluded.slot_id, slot_label=excluded.slot_label,
-                  start_ms=excluded.start_ms, phone=excluded.phone, customer_name=excluded.customer_name, status=excluded.status, job_timestamp=excluded.job_timestamp
-              `).bind(b.id, b.dateISO ?? null, b.slotId ?? null, b.slotLabel ?? null, b.startMs ?? null, b.phone || "", b.customerName || "", b.status || "accepted", b.jobTimestamp || null, b.createdAt || Date.now()).run();
+                  start_ms=excluded.start_ms, phone=excluded.phone, customer_name=excluded.customer_name, status=excluded.status, job_timestamp=excluded.job_timestamp, assigned_to=excluded.assigned_to
+              `).bind(b.id, b.dateISO ?? null, b.slotId ?? null, b.slotLabel ?? null, b.startMs ?? null, b.phone || "", b.customerName || "", b.status || "accepted", b.jobTimestamp || null, b.createdAt || Date.now(), b.assignedTo ?? null).run();
             }
             if (m.oldApptId) await db.prepare("DELETE FROM appointments WHERE id = ?").bind(m.oldApptId).run();
             if (m.newAppt) {
@@ -803,7 +1004,7 @@ export default {
 
       if (path.startsWith("/api/customer-profiles/") && request.method === "DELETE") {
         const user = await getUserFromToken(db, getToken(request));
-        if (!user || user.role !== "owner") return errorResponse("Only the owner can delete a customer.", 403);
+        if (!user || (user.role !== "owner" && user.role !== "manager")) return errorResponse("Only the owner or a manager can delete a customer.", 403);
         const phone = decodeURIComponent(path.split("/api/customer-profiles/")[1]);
 
         const profile = await db.prepare("SELECT * FROM customer_profiles WHERE phone = ?").bind(phone).first();
@@ -830,14 +1031,14 @@ export default {
 
       if (path === "/api/deleted-customers" && request.method === "GET") {
         const user = await getUserFromToken(db, getToken(request));
-        if (!user || user.role !== "owner") return errorResponse("Owner access only.", 403);
+        if (!user || (user.role !== "owner" && user.role !== "manager")) return errorResponse("Owner or manager access only.", 403);
         const { results } = await db.prepare("SELECT id, phone, deleted_by, deleted_by_role, deleted_at, restored, profile_snapshot FROM deleted_customers_log ORDER BY deleted_at DESC LIMIT 50").all();
         return jsonResponse({ deletedCustomers: results });
       }
 
       if (path.startsWith("/api/deleted-customers/") && path.endsWith("/restore") && request.method === "POST") {
         const user = await getUserFromToken(db, getToken(request));
-        if (!user || user.role !== "owner") return errorResponse("Owner access only.", 403);
+        if (!user || (user.role !== "owner" && user.role !== "manager")) return errorResponse("Owner or manager access only.", 403);
         const id = decodeURIComponent(path.split("/api/deleted-customers/")[1].replace(/\/restore$/, ""));
         const log = await db.prepare("SELECT * FROM deleted_customers_log WHERE id = ?").bind(id).first();
         if (!log) return errorResponse("No deletion record with that id.", 404);
@@ -868,10 +1069,10 @@ export default {
         }
         for (const b of JSON.parse(log.bookings_snapshot)) {
           await db.prepare(`
-            INSERT INTO bookings (id, date_iso, slot_id, slot_label, start_ms, phone, customer_name, status, job_timestamp, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO bookings (id, date_iso, slot_id, slot_label, start_ms, phone, customer_name, status, job_timestamp, created_at, assigned_to)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO NOTHING
-          `).bind(b.id, b.date_iso, b.slot_id, b.slot_label, b.start_ms, b.phone, b.customer_name, b.status, b.job_timestamp, b.created_at).run();
+          `).bind(b.id, b.date_iso, b.slot_id, b.slot_label, b.start_ms, b.phone, b.customer_name, b.status, b.job_timestamp, b.created_at, b.assigned_to ?? null).run();
         }
         await db.prepare("UPDATE deleted_customers_log SET restored = 1 WHERE id = ?").bind(id).run();
         return jsonResponse({ success: true });
@@ -879,7 +1080,7 @@ export default {
 
       if (path.startsWith("/api/customers/") && path.endsWith("/change-phone") && request.method === "POST") {
         const user = await getUserFromToken(db, getToken(request));
-        if (!user || user.role !== "owner") return errorResponse("Only the owner can change a customer's phone number.", 403);
+        if (!user || (user.role !== "owner" && user.role !== "manager")) return errorResponse("Only the owner or a manager can change a customer's phone number.", 403);
         const oldPhone = decodeURIComponent(path.split("/api/customers/")[1].replace(/\/change-phone$/, ""));
         const data = await request.json();
         const newPhone = (data.newPhone || "").trim();
@@ -900,6 +1101,7 @@ export default {
           await db.prepare("DELETE FROM customer_profiles WHERE phone = ?").bind(oldPhone).run();
           await db.prepare("UPDATE estimates SET phone = ? WHERE phone = ?").bind(newPhone, oldPhone).run();
           await db.prepare("UPDATE bookings SET phone = ? WHERE phone = ?").bind(newPhone, oldPhone).run();
+          await db.prepare("UPDATE photo_shot_lists SET scope = ? WHERE scope = ?").bind(`customer:${newPhone}`, `customer:${oldPhone}`).run();
 
           const { results: appts } = await db.prepare("SELECT * FROM appointments WHERE phone = ?").bind(oldPhone).all();
           for (const a of appts) {
