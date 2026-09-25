@@ -17,7 +17,7 @@
   ],
   "r2_buckets": [
     {
-      "binding": "JOB_PHOTOS",
+      "binding": "PHOTOS",
       "bucket_name": "rdubs-job-photos"
     }
   ]
