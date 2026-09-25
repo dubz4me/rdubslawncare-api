@@ -78,6 +78,185 @@ async function getUserFromToken(db, token) {
 }
 
 
+
+
+
+
+function b64urlBytes(bytes) {
+  let s = "";
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function b64urlText(text) {
+  return b64urlBytes(new TextEncoder().encode(text));
+}
+
+function b64urlDecodeBytes(value) {
+  const s = String(value || "").replace(/-/g, "+").replace(/_/g, "/");
+  const padded = s + "=".repeat((4 - (s.length % 4)) % 4);
+  const raw = atob(padded);
+  return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+}
+
+async function ensureWebPushTables(db) {
+  await db.prepare(`CREATE TABLE IF NOT EXISTS web_push_keys (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    public_key TEXT NOT NULL,
+    private_jwk TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  )`).run();
+  await db.prepare(`CREATE TABLE IF NOT EXISTS web_push_subscriptions (
+    endpoint TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    p256dh TEXT,
+    auth TEXT,
+    created_at INTEGER NOT NULL,
+    last_seen INTEGER NOT NULL
+  )`).run();
+}
+
+async function getOrCreateVapidKeys(db) {
+  await ensureWebPushTables(db);
+  let row = await db.prepare("SELECT public_key, private_jwk FROM web_push_keys WHERE id = 1").first();
+  if (row) return { publicKey: row.public_key, privateJwk: JSON.parse(row.private_jwk) };
+  const pair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+  const pub = await crypto.subtle.exportKey("jwk", pair.publicKey);
+  const priv = await crypto.subtle.exportKey("jwk", pair.privateKey);
+  const x = b64urlDecodeBytes(pub.x);
+  const y = b64urlDecodeBytes(pub.y);
+  const uncompressed = new Uint8Array(65);
+  uncompressed[0] = 4;
+  uncompressed.set(x, 1);
+  uncompressed.set(y, 33);
+  const publicKey = b64urlBytes(uncompressed);
+  await db.prepare("INSERT INTO web_push_keys (id, public_key, private_jwk, created_at) VALUES (1, ?, ?, ?)")
+    .bind(publicKey, JSON.stringify(priv), Date.now()).run();
+  return { publicKey, privateJwk: priv };
+}
+
+async function sendEmptyWebPush(endpoint, keys) {
+  const endpointUrl = new URL(endpoint);
+  const aud = `${endpointUrl.protocol}//${endpointUrl.host}`;
+  const now = Math.floor(Date.now() / 1000);
+  const header = b64urlText(JSON.stringify({ typ: "JWT", alg: "ES256" }));
+  const payload = b64urlText(JSON.stringify({ aud, exp: now + 12 * 60 * 60, sub: "mailto:support@rdubslawncare.com" }));
+  const unsigned = `${header}.${payload}`;
+  const privateKey = await crypto.subtle.importKey("jwk", keys.privateJwk, { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
+  const signature = new Uint8Array(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, privateKey, new TextEncoder().encode(unsigned)));
+  const jwt = `${unsigned}.${b64urlBytes(signature)}`;
+  return fetch(endpoint, {
+    method: "POST",
+    headers: {
+      TTL: "120",
+      Urgency: "high",
+      Authorization: `vapid t=${jwt}, k=${keys.publicKey}`,
+    },
+  });
+}
+
+async function pushUsers(db, userIds) {
+  if (!Array.isArray(userIds) || !userIds.length) return;
+  try {
+    const keys = await getOrCreateVapidKeys(db);
+    for (const userId of userIds) {
+      const { results } = await db.prepare("SELECT endpoint FROM web_push_subscriptions WHERE user_id = ?").bind(userId).all();
+      for (const row of results || []) {
+        try {
+          const res = await sendEmptyWebPush(row.endpoint, keys);
+          if (res.status === 404 || res.status === 410) {
+            await db.prepare("DELETE FROM web_push_subscriptions WHERE endpoint = ?").bind(row.endpoint).run();
+          }
+        } catch (e) {
+          console.warn("[WEB PUSH] Send failed:", e.message);
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("[WEB PUSH] Setup/send failed:", e.message);
+  }
+}
+
+async function ensureCrewScheduleBoardTables(db) {
+  await db.prepare(`CREATE TABLE IF NOT EXISTS crew_schedule_weeks (
+    user_id INTEGER NOT NULL,
+    week_start TEXT NOT NULL,
+    schedule_json TEXT NOT NULL DEFAULT '{}',
+    updated_at INTEGER NOT NULL,
+    updated_by TEXT,
+    PRIMARY KEY (user_id, week_start)
+  )`).run();
+  await db.prepare(`CREATE TABLE IF NOT EXISTS crew_schedule_history (
+    id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    week_start TEXT NOT NULL,
+    schedule_json TEXT NOT NULL,
+    changed_at INTEGER NOT NULL,
+    changed_by TEXT
+  )`).run();
+}
+
+function mondayISOFromDate(input) {
+  const d = input ? new Date(`${input}T12:00:00`) : new Date();
+  if (Number.isNaN(d.getTime())) return null;
+  const day = d.getDay();
+  const diff = day === 0 ? -6 : 1 - day;
+  d.setDate(d.getDate() + diff);
+  return d.toISOString().slice(0, 10);
+}
+
+function addDaysISO(iso, days) {
+  const d = new Date(`${iso}T12:00:00`);
+  d.setDate(d.getDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+async function ensureTeamNoticesTables(db) {
+  await db.prepare(`CREATE TABLE IF NOT EXISTS team_notices (
+    id TEXT PRIMARY KEY,
+    sender_user_id INTEGER NOT NULL,
+    sender_name TEXT NOT NULL,
+    title TEXT NOT NULL,
+    message TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  )`).run();
+  await db.prepare(`CREATE TABLE IF NOT EXISTS team_notice_recipients (
+    notice_id TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    read_at INTEGER,
+    PRIMARY KEY (notice_id, user_id),
+    FOREIGN KEY (notice_id) REFERENCES team_notices(id),
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  )`).run();
+}
+
+async function ensureCrewProfilesTable(db) {
+  await db.prepare(`CREATE TABLE IF NOT EXISTS crew_profiles (
+    user_id INTEGER PRIMARY KEY,
+    bio TEXT NOT NULL DEFAULT '',
+    phone TEXT NOT NULL DEFAULT '',
+    email TEXT NOT NULL DEFAULT '',
+    address TEXT NOT NULL DEFAULT '',
+    emergency_name TEXT NOT NULL DEFAULT '',
+    emergency_phone TEXT NOT NULL DEFAULT '',
+    photo_updated_at INTEGER,
+    updated_at INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  )`).run();
+}
+
+
+function resolveProfileTargetParam(param, currentUsername) {
+  const raw = decodeURIComponent(param || "");
+  if (raw === "__me__") return currentUsername;
+  if (raw.startsWith("member:")) return raw.slice(7);
+  return raw;
+}
+
+function cleanProfileText(value, max) {
+  return String(value == null ? "" : value).trim().slice(0, max);
+}
+
 async function ensureRoleNotificationsTable(db) {
   await db.prepare(`CREATE TABLE IF NOT EXISTS role_notifications (
     id TEXT PRIMARY KEY,
@@ -395,7 +574,7 @@ export default {
             "appointments", "customer-profiles", "customers-change-phone", "expenses", "inventory-items",
             "time-logs", "availability", "bug-reports", "crew-schedules", "site-content", "deleted-customers",
             "auth-users-pause", "manager-role", "change-password", "reset-password", "forgot-password",
-            "role-notifications", "time-clock", "quote", "job-photos-r2", "photo-checklists",
+            "role-notifications", "time-clock", "quote", "job-photos-r2", "photo-checklists", "crew-profiles", "emergency-logout", "team-notices", "crew-schedule-board", "web-push",
           ],
         });
       }
@@ -420,6 +599,263 @@ export default {
           console.warn("[ROLE NOTICE] Could not acknowledge notification:", e.message);
         }
         return jsonResponse({ success: true });
+      }
+
+      // ================= WEB PUSH =================
+      if (path === "/api/push/public-key" && request.method === "GET") {
+        const keys = await getOrCreateVapidKeys(db);
+        return jsonResponse({ publicKey: keys.publicKey });
+      }
+
+      if (path === "/api/push/subscribe" && request.method === "POST") {
+        await ensureWebPushTables(db);
+        const body = await request.json().catch(() => ({}));
+        const endpoint = String(body.endpoint || "").trim();
+        if (!endpoint.startsWith("https://")) return errorResponse("A valid push endpoint is required.", 400);
+        const p256dh = String(body.keys && body.keys.p256dh || "").slice(0, 300);
+        const auth = String(body.keys && body.keys.auth || "").slice(0, 300);
+        await db.prepare(`
+          INSERT INTO web_push_subscriptions (endpoint, user_id, p256dh, auth, created_at, last_seen)
+          VALUES (?, ?, ?, ?, ?, ?)
+          ON CONFLICT(endpoint) DO UPDATE SET
+            user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth, last_seen = excluded.last_seen
+        `).bind(endpoint, user.id, p256dh, auth, Date.now(), Date.now()).run();
+        return jsonResponse({ success: true });
+      }
+
+      if (path === "/api/push/unsubscribe" && request.method === "POST") {
+        await ensureWebPushTables(db);
+        const body = await request.json().catch(() => ({}));
+        const endpoint = String(body.endpoint || "").trim();
+        if (endpoint) await db.prepare("DELETE FROM web_push_subscriptions WHERE endpoint = ? AND user_id = ?").bind(endpoint, user.id).run();
+        return jsonResponse({ success: true });
+      }
+
+      // ================= TEAM NOTICES =================
+      // Signed-in users receive notices addressed to them.
+      // Owner and Manager accounts can send notices to selected active team members.
+      if (path === "/api/team-notices/recipients" && request.method === "GET") {
+        if (user.role !== "owner" && user.role !== "manager") return errorResponse("Manager or owner access only.", 403);
+        const { results } = await db.prepare(
+          "SELECT id, name, role FROM users WHERE disabled = 0 ORDER BY CASE role WHEN 'owner' THEN 0 WHEN 'manager' THEN 1 ELSE 2 END, name, id"
+        ).all();
+        return jsonResponse({ recipients: (results || []).map((r) => ({
+          id: r.id,
+          name: r.name || "Team Member",
+          role: r.role,
+          isSelf: r.id === user.id,
+        })) });
+      }
+
+      if (path === "/api/team-notices" && request.method === "GET") {
+        await ensureTeamNoticesTables(db);
+        const { results } = await db.prepare(`
+          SELECT n.id, n.sender_name, n.title, n.message, n.created_at, r.read_at
+          FROM team_notice_recipients r
+          JOIN team_notices n ON n.id = r.notice_id
+          WHERE r.user_id = ?
+          ORDER BY n.created_at DESC
+          LIMIT 50
+        `).bind(user.id).all();
+        return jsonResponse({ notices: (results || []).map((n) => ({
+          id: n.id,
+          senderName: n.sender_name,
+          title: n.title,
+          message: n.message,
+          createdAt: n.created_at,
+          readAt: n.read_at || null,
+        })) });
+      }
+
+      if (path === "/api/team-notices" && request.method === "POST") {
+        if (user.role !== "owner" && user.role !== "manager") return errorResponse("Manager or owner access only.", 403);
+        await ensureTeamNoticesTables(db);
+        const body = await request.json().catch(() => ({}));
+        const title = String(body.title || "Team Notice").trim().slice(0, 80) || "Team Notice";
+        const message = String(body.message || "").trim().slice(0, 1200);
+        if (!message) return errorResponse("A notice message is required.");
+
+        let recipientIds = [];
+        if (body.all === true) {
+          const { results } = await db.prepare("SELECT id FROM users WHERE disabled = 0 AND id <> ? ORDER BY id").bind(user.id).all();
+          recipientIds = (results || []).map((r) => Number(r.id));
+        } else if (Array.isArray(body.recipientIds)) {
+          recipientIds = [...new Set(body.recipientIds.map(Number).filter((id) => Number.isInteger(id) && id > 0))];
+        }
+        if (!recipientIds.length) return errorResponse("Select at least one team member.");
+
+        const placeholders = recipientIds.map(() => "?").join(",");
+        const { results: validRows } = await db.prepare(`SELECT id FROM users WHERE disabled = 0 AND id IN (${placeholders})`)
+          .bind(...recipientIds).all();
+        const validIds = (validRows || []).map((r) => Number(r.id));
+        if (!validIds.length) return errorResponse("No active recipients were selected.");
+
+        const id = crypto.randomUUID();
+        await db.prepare("INSERT INTO team_notices (id, sender_user_id, sender_name, title, message, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+          .bind(id, user.id, user.name || "R-DUB'S", title, message, Date.now()).run();
+        for (const recipientId of validIds) {
+          await db.prepare("INSERT OR IGNORE INTO team_notice_recipients (notice_id, user_id, read_at) VALUES (?, ?, NULL)")
+            .bind(id, recipientId).run();
+        }
+        await pushUsers(db, validIds);
+        return jsonResponse({ success: true, id, recipientCount: validIds.length });
+      }
+
+      const noticeReadMatch = path.match(/^\/api\/team-notices\/([^/]+)\/read$/);
+      if (noticeReadMatch && request.method === "POST") {
+        await ensureTeamNoticesTables(db);
+        const noticeId = decodeURIComponent(noticeReadMatch[1]);
+        const row = await db.prepare("SELECT notice_id FROM team_notice_recipients WHERE notice_id = ? AND user_id = ?")
+          .bind(noticeId, user.id).first();
+        if (!row) return errorResponse("Notice not found.", 404);
+        await db.prepare("UPDATE team_notice_recipients SET read_at = ? WHERE notice_id = ? AND user_id = ?")
+          .bind(Date.now(), noticeId, user.id).run();
+        return jsonResponse({ success: true });
+      }
+
+      // ================= CREW PROFILES =================
+      // Basic work profile details are visible to signed-in team members.
+      // Personal contact/address/emergency information is server-protected and only
+      // returned to the profile owner, managers, and the owner.
+      if (path === "/api/crew-profiles" && request.method === "GET") {
+        await ensureCrewProfilesTable(db);
+        const { results } = await db.prepare(`
+          SELECT u.username, u.name, u.role, u.disabled,
+                 COALESCE(cp.bio, '') AS bio,
+                 cp.photo_updated_at
+          FROM users u
+          LEFT JOIN crew_profiles cp ON cp.user_id = u.id
+          WHERE u.disabled = 0
+          ORDER BY CASE u.role WHEN 'owner' THEN 0 WHEN 'manager' THEN 1 ELSE 2 END, u.name, u.username
+        `).all();
+        const profiles = (results || []).map((r) => ({
+          name: r.name || "",
+          role: r.role,
+          bio: r.bio || "",
+          photoUpdatedAt: r.photo_updated_at || null,
+          profileKey: r.username === user.username ? "__me__" : `member:${r.username}`,
+          isSelf: r.username === user.username,
+        }));
+        return jsonResponse({ profiles });
+      }
+
+      const crewProfilePhotoMatch = path.match(/^\/api\/crew-profiles\/([^/]+)\/photo$/);
+      if (crewProfilePhotoMatch) {
+        const targetUsername = resolveProfileTargetParam(crewProfilePhotoMatch[1], user.username);
+        const target = await db.prepare("SELECT id, username FROM users WHERE username = ? AND disabled = 0").bind(targetUsername).first();
+        if (!target) return errorResponse("No active team member with that username.", 404);
+        if (!env.PHOTOS) return errorResponse("Profile photo storage isn't connected yet.", 500);
+        const key = `profiles/${target.id}.jpg`;
+
+        if (request.method === "GET") {
+          const obj = await env.PHOTOS.get(key);
+          if (!obj) return errorResponse("Profile photo not found.", 404);
+          return new Response(obj.body, { headers: {
+            "Content-Type": (obj.httpMetadata && obj.httpMetadata.contentType) || "image/jpeg",
+            "Cache-Control": "private, max-age=3600",
+            "Access-Control-Allow-Origin": "*",
+          } });
+        }
+
+        if (target.id !== user.id) return errorResponse("You can only change your own profile photo.", 403);
+
+        if (request.method === "POST") {
+          const data = await request.json().catch(() => ({}));
+          const m = /^data:(image\/(?:jpeg|png|webp));base64,(.+)$/.exec(data.dataUri || "");
+          if (!m) return errorResponse("Expected a JPEG, PNG, or WebP image.");
+          const bytes = Uint8Array.from(atob(m[2]), (c) => c.charCodeAt(0));
+          if (bytes.length > 5 * 1024 * 1024) return errorResponse("Profile photo is too large (5MB max).");
+          await env.PHOTOS.put(key, bytes, { httpMetadata: { contentType: m[1] }, customMetadata: { uploadedBy: user.username } });
+          await ensureCrewProfilesTable(db);
+          await db.prepare(`
+            INSERT INTO crew_profiles (user_id, photo_updated_at, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET photo_updated_at = excluded.photo_updated_at, updated_at = excluded.updated_at
+          `).bind(user.id, Date.now(), Date.now()).run();
+          return jsonResponse({ success: true });
+        }
+
+        if (request.method === "DELETE") {
+          await env.PHOTOS.delete(key);
+          await ensureCrewProfilesTable(db);
+          await db.prepare(`
+            INSERT INTO crew_profiles (user_id, photo_updated_at, updated_at) VALUES (?, NULL, ?)
+            ON CONFLICT(user_id) DO UPDATE SET photo_updated_at = NULL, updated_at = excluded.updated_at
+          `).bind(user.id, Date.now()).run();
+          return jsonResponse({ success: true });
+        }
+      }
+
+      const crewProfileMatch = path.match(/^\/api\/crew-profiles\/([^/]+)$/);
+      if (crewProfileMatch) {
+        const targetUsername = resolveProfileTargetParam(crewProfileMatch[1], user.username);
+        await ensureCrewProfilesTable(db);
+        const target = await db.prepare(`
+          SELECT u.id, u.username, u.name, u.role, u.disabled,
+                 COALESCE(cp.bio, '') AS bio,
+                 COALESCE(cp.phone, '') AS phone,
+                 COALESCE(cp.email, '') AS email,
+                 COALESCE(cp.address, '') AS address,
+                 COALESCE(cp.emergency_name, '') AS emergency_name,
+                 COALESCE(cp.emergency_phone, '') AS emergency_phone,
+                 cp.photo_updated_at
+          FROM users u
+          LEFT JOIN crew_profiles cp ON cp.user_id = u.id
+          WHERE u.username = ? AND u.disabled = 0
+        `).bind(targetUsername).first();
+        if (!target) return errorResponse("No active team member with that username.", 404);
+
+        if (request.method === "GET") {
+          const canSeePrivate = target.id === user.id || user.role === "manager" || user.role === "owner";
+          const profile = {
+            name: target.name,
+            role: target.role,
+            bio: target.bio,
+            photoUpdatedAt: target.photo_updated_at || null,
+            canSeePrivate,
+            isSelf: target.id === user.id,
+          };
+          if (canSeePrivate) {
+            profile.private = {
+              phone: target.phone,
+              email: target.email,
+              address: target.address,
+              emergencyName: target.emergency_name,
+              emergencyPhone: target.emergency_phone,
+            };
+          }
+          return jsonResponse({ profile });
+        }
+
+        if (request.method === "POST") {
+          if (target.id !== user.id) return errorResponse("You can only edit your own profile.", 403);
+          const data = await request.json().catch(() => ({}));
+          const bio = cleanProfileText(data.bio, 500);
+          const phone = cleanProfileText(data.phone, 60);
+          const email = cleanProfileText(data.email, 160);
+          const address = cleanProfileText(data.address, 260);
+          const emergencyName = cleanProfileText(data.emergencyName, 120);
+          const emergencyPhone = cleanProfileText(data.emergencyPhone, 60);
+          await db.prepare(`
+            INSERT INTO crew_profiles (user_id, bio, phone, email, address, emergency_name, emergency_phone, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              bio = excluded.bio, phone = excluded.phone, email = excluded.email, address = excluded.address,
+              emergency_name = excluded.emergency_name, emergency_phone = excluded.emergency_phone,
+              updated_at = excluded.updated_at
+          `).bind(user.id, bio, phone, email, address, emergencyName, emergencyPhone, Date.now()).run();
+          return jsonResponse({ success: true });
+        }
+      }
+
+      // Owner emergency/session reset: signs every account out, including the owner.
+      // Used for urgent security events or when a clean re-login is needed after an update.
+      if (path === "/api/auth/emergency-logout" && request.method === "POST") {
+        if (user.role !== "owner") return errorResponse("Owner access only.", 403);
+        const body = await request.json().catch(() => ({}));
+        const confirmText = String(body.confirm || "");
+        if (confirmText !== "LOG OUT EVERYONE") return errorResponse("Confirmation required.", 400);
+        await db.prepare("DELETE FROM sessions").run();
+        return jsonResponse({ success: true, message: "All active sessions have been signed out." });
       }
 
       // ================= ACCOUNT / TEAM SETTINGS =================
@@ -497,6 +933,94 @@ export default {
         if (user.role !== "owner") return errorResponse("Owner access only.", 403);
         const { results } = await db.prepare("SELECT id, username, requested_at, status FROM password_reset_requests WHERE status = 'pending' ORDER BY requested_at DESC").all();
         return jsonResponse({ requests: results || [] });
+      }
+
+      // ================= TWO-WEEK CREW SCHEDULE BOARD =================
+      if (path === "/api/crew-schedule-board" && request.method === "GET") {
+        await ensureCrewScheduleBoardTables(db);
+        const requested = url.searchParams.get("start");
+        const week1 = mondayISOFromDate(requested) || mondayISOFromDate();
+        const week2 = addDaysISO(week1, 7);
+        const pastStarts = [addDaysISO(week1, -7), addDaysISO(week1, -14), addDaysISO(week1, -21), addDaysISO(week1, -28)];
+        const { results: peopleRows } = await db.prepare(
+          "SELECT id, name, role FROM users WHERE disabled = 0 ORDER BY CASE role WHEN 'owner' THEN 0 WHEN 'manager' THEN 1 ELSE 2 END, name, id"
+        ).all();
+        const people = [];
+        for (const p of peopleRows || []) {
+          const { results: rows } = await db.prepare(
+            "SELECT week_start, schedule_json, updated_at, updated_by FROM crew_schedule_weeks WHERE user_id = ? AND week_start IN (?, ?, ?, ?, ?, ?) ORDER BY week_start"
+          ).bind(p.id, week1, week2, ...pastStarts).all();
+          const byWeek = {};
+          for (const row of rows || []) {
+            let parsed = {};
+            try { parsed = JSON.parse(row.schedule_json || "{}"); } catch (e) {}
+            byWeek[row.week_start] = { schedule: parsed, updatedAt: row.updated_at, updatedBy: row.updated_by };
+          }
+          people.push({
+            id: p.id,
+            name: p.name || "Team Member",
+            role: p.role,
+            weeks: [
+              { weekStart: week1, ...(byWeek[week1] || { schedule: {} }) },
+              { weekStart: week2, ...(byWeek[week2] || { schedule: {} }) },
+            ],
+            pastWeeks: pastStarts.map((weekStart) => ({ weekStart, ...(byWeek[weekStart] || { schedule: {} }) })),
+          });
+        }
+        return jsonResponse({
+          weekStarts: [week1, week2],
+          people,
+          canEdit: user.role === "owner" || user.role === "manager",
+          currentUserId: user.id,
+        });
+      }
+
+      const crewBoardSaveMatch = path.match(/^\/api\/crew-schedule-board\/(\d+)\/(\d{4}-\d{2}-\d{2})$/);
+      if (crewBoardSaveMatch && request.method === "POST") {
+        if (user.role !== "owner" && user.role !== "manager") return errorResponse("Manager or owner access only.", 403);
+        await ensureCrewScheduleBoardTables(db);
+        const targetId = Number(crewBoardSaveMatch[1]);
+        const weekStart = mondayISOFromDate(crewBoardSaveMatch[2]);
+        if (!targetId || !weekStart) return errorResponse("Invalid schedule target.", 400);
+        const target = await db.prepare("SELECT id, role FROM users WHERE id = ? AND disabled = 0").bind(targetId).first();
+        if (!target) return errorResponse("Team member not found.", 404);
+        if (user.role === "manager" && target.role === "owner") return errorResponse("Managers cannot edit the owner's schedule.", 403);
+        const body = await request.json().catch(() => ({}));
+        if (!body.schedule || typeof body.schedule !== "object" || Array.isArray(body.schedule)) return errorResponse("A schedule is required.");
+        const scheduleJson = JSON.stringify(body.schedule);
+        if (scheduleJson.length > 12000) return errorResponse("Schedule is too large.", 400);
+        const existing = await db.prepare("SELECT schedule_json FROM crew_schedule_weeks WHERE user_id = ? AND week_start = ?")
+          .bind(targetId, weekStart).first();
+        if (existing && existing.schedule_json !== scheduleJson) {
+          await db.prepare("INSERT INTO crew_schedule_history (id, user_id, week_start, schedule_json, changed_at, changed_by) VALUES (?, ?, ?, ?, ?, ?)")
+            .bind(crypto.randomUUID(), targetId, weekStart, existing.schedule_json, Date.now(), user.name || "Manager").run();
+        }
+        await db.prepare(`
+          INSERT INTO crew_schedule_weeks (user_id, week_start, schedule_json, updated_at, updated_by)
+          VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT(user_id, week_start) DO UPDATE SET
+            schedule_json = excluded.schedule_json,
+            updated_at = excluded.updated_at,
+            updated_by = excluded.updated_by
+        `).bind(targetId, weekStart, scheduleJson, Date.now(), user.name || user.username).run();
+        return jsonResponse({ success: true });
+      }
+
+      if (path === "/api/crew-schedule-board/history" && request.method === "GET") {
+        if (user.role !== "owner" && user.role !== "manager") return errorResponse("Manager or owner access only.", 403);
+        await ensureCrewScheduleBoardTables(db);
+        const targetId = Number(url.searchParams.get("userId"));
+        const weekStart = mondayISOFromDate(url.searchParams.get("weekStart"));
+        if (!targetId || !weekStart) return errorResponse("userId and weekStart are required.", 400);
+        const { results } = await db.prepare(
+          "SELECT id, schedule_json, changed_at, changed_by FROM crew_schedule_history WHERE user_id = ? AND week_start = ? ORDER BY changed_at DESC LIMIT 25"
+        ).bind(targetId, weekStart).all();
+        const history = (results || []).map((row) => {
+          let schedule = {};
+          try { schedule = JSON.parse(row.schedule_json || "{}"); } catch (e) {}
+          return { id: row.id, schedule, changedAt: row.changed_at, changedBy: row.changed_by };
+        });
+        return jsonResponse({ history });
       }
 
       if (path === "/api/crew-schedules" && request.method === "GET") {
