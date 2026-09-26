@@ -177,6 +177,31 @@ async function pushUsers(db, userIds) {
   }
 }
 
+
+async function ensureJobRoleTables(db) {
+  await db.prepare(`CREATE TABLE IF NOT EXISTS job_role_assignments (
+    job_timestamp INTEGER PRIMARY KEY,
+    booking_id TEXT,
+    date_iso TEXT,
+    crew_ids_json TEXT NOT NULL DEFAULT '[]',
+    assignments_json TEXT NOT NULL DEFAULT '{}',
+    updated_at INTEGER NOT NULL,
+    updated_by TEXT
+  )`).run();
+  await db.prepare(`CREATE TABLE IF NOT EXISTS job_role_assignment_history (
+    id TEXT PRIMARY KEY,
+    job_timestamp INTEGER NOT NULL,
+    booking_id TEXT,
+    date_iso TEXT,
+    crew_ids_json TEXT NOT NULL,
+    assignments_json TEXT NOT NULL,
+    changed_at INTEGER NOT NULL,
+    changed_by TEXT
+  )`).run();
+}
+function allowedJobRoleKey(key) {
+  return ["lead","mowing","trim","cleanup","photos"].includes(String(key||""));
+}
 async function ensureCrewScheduleBoardTables(db) {
   await db.prepare(`CREATE TABLE IF NOT EXISTS crew_schedule_weeks (
     user_id INTEGER NOT NULL,
@@ -211,6 +236,22 @@ function addDaysISO(iso, days) {
   return d.toISOString().slice(0, 10);
 }
 
+
+async function ensureTeamChatTables(db) {
+  await db.prepare(`CREATE TABLE IF NOT EXISTS team_chat_messages (
+    id TEXT PRIMARY KEY, room_key TEXT NOT NULL, sender_user_id INTEGER NOT NULL, message TEXT NOT NULL, created_at INTEGER NOT NULL
+  )`).run();
+  await db.prepare(`CREATE TABLE IF NOT EXISTS team_chat_reads (
+    user_id INTEGER NOT NULL, room_key TEXT NOT NULL, last_read_at INTEGER NOT NULL, PRIMARY KEY (user_id, room_key)
+  )`).run();
+}
+function directRoomKey(a,b){const x=Math.min(Number(a),Number(b)),y=Math.max(Number(a),Number(b));return `direct:${x}:${y}`;}
+function chatRoomKey(user,room,recipientId){
+  if(room==="crew")return "crew";
+  if(room==="management")return user.role==="owner"||user.role==="manager"?"management":null;
+  if(room==="direct"&&recipientId)return directRoomKey(user.id,recipientId);
+  return null;
+}
 async function ensureTeamNoticesTables(db) {
   await db.prepare(`CREATE TABLE IF NOT EXISTS team_notices (
     id TEXT PRIMARY KEY,
@@ -230,6 +271,118 @@ async function ensureTeamNoticesTables(db) {
   )`).run();
 }
 
+
+
+const ENV_DELETE_ORDER = [
+  "job_photos","job_role_assignment_history","job_role_assignments","crew_schedule_history","crew_schedule_weeks","employee_time_audit","employee_time_entries",
+  "appointments","bookings","expenses","time_logs","customer_plans","customer_portal_tokens",
+  "deleted_customers_log","photo_shot_lists","estimates","customer_profiles","inventory_items","crew_schedules"
+];
+const ENV_RESTORE_ORDER = [
+  "customer_profiles","estimates","bookings","appointments","expenses","inventory_items","time_logs","crew_schedules",
+  "crew_schedule_weeks","crew_schedule_history","employee_time_entries","employee_time_audit",
+  "customer_plans","customer_portal_tokens","photo_shot_lists","job_photos","job_role_assignments","job_role_assignment_history","deleted_customers_log"
+];
+
+async function ensureAppEnvironmentTables(db) {
+  await db.prepare(`CREATE TABLE IF NOT EXISTS app_environment_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    current_mode TEXT NOT NULL DEFAULT 'beta',
+    live_started_at INTEGER,
+    updated_at INTEGER NOT NULL,
+    updated_by TEXT
+  )`).run();
+  await db.prepare(`CREATE TABLE IF NOT EXISTS app_environment_records (
+    mode TEXT NOT NULL,
+    table_name TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    row_json TEXT NOT NULL,
+    saved_at INTEGER NOT NULL,
+    PRIMARY KEY (mode, table_name, seq)
+  )`).run();
+  await db.prepare(`INSERT OR IGNORE INTO app_environment_state (id,current_mode,updated_at,updated_by) VALUES (1,'beta',?,?)`)
+    .bind(Date.now(),"system").run();
+}
+async function currentAppMode(db) {
+  await ensureAppEnvironmentTables(db);
+  const row = await db.prepare("SELECT current_mode,live_started_at,updated_at,updated_by FROM app_environment_state WHERE id=1").first();
+  return row || { current_mode:"beta", live_started_at:null, updated_at:Date.now(), updated_by:"system" };
+}
+async function tableColumns(db, table) {
+  try {
+    const { results } = await db.prepare(`PRAGMA table_info(${table})`).all();
+    return (results || []).map(r => r.name).filter(Boolean);
+  } catch (e) { return []; }
+}
+async function snapshotEnvironment(db, mode) {
+  const now = Date.now();
+  for (const table of ENV_RESTORE_ORDER) {
+    const cols = await tableColumns(db, table);
+    if (!cols.length) continue;
+    await db.prepare("DELETE FROM app_environment_records WHERE mode=? AND table_name=?").bind(mode,table).run();
+    const { results } = await db.prepare(`SELECT * FROM ${table}`).all();
+    let seq = 0;
+    for (const row of results || []) {
+      await db.prepare("INSERT INTO app_environment_records (mode,table_name,seq,row_json,saved_at) VALUES (?,?,?,?,?)")
+        .bind(mode,table,seq++,JSON.stringify(row),now).run();
+    }
+  }
+}
+async function clearEnvironmentTables(db) {
+  for (const table of ENV_DELETE_ORDER) {
+    const cols = await tableColumns(db, table);
+    if (!cols.length) continue;
+    try { await db.prepare(`DELETE FROM ${table}`).run(); } catch (e) {}
+  }
+}
+async function restoreEnvironment(db, mode) {
+  for (const table of ENV_RESTORE_ORDER) {
+    const cols = await tableColumns(db, table);
+    if (!cols.length) continue;
+    const { results } = await db.prepare("SELECT row_json FROM app_environment_records WHERE mode=? AND table_name=? ORDER BY seq ASC")
+      .bind(mode,table).all();
+    for (const rec of results || []) {
+      let row = {};
+      try { row = JSON.parse(rec.row_json || "{}"); } catch (e) { continue; }
+      const use = cols.filter(c => Object.prototype.hasOwnProperty.call(row,c));
+      if (!use.length) continue;
+      const q = use.map(()=>"?").join(",");
+      await db.prepare(`INSERT INTO ${table} (${use.join(",")}) VALUES (${q})`).bind(...use.map(c=>row[c])).run();
+    }
+  }
+}
+async function switchAppEnvironment(db, targetMode, actor) {
+  await ensureAppEnvironmentTables(db);
+  const state = await currentAppMode(db);
+  const current = state.current_mode === "live" ? "live" : "beta";
+  const target = targetMode === "live" ? "live" : "beta";
+  if (target === current) return { changed:false, mode:current, liveStartedAt:state.live_started_at || null };
+  await snapshotEnvironment(db,current);
+  try {
+    await clearEnvironmentTables(db);
+    await restoreEnvironment(db,target);
+    const liveStartedAt = target === "live" ? (state.live_started_at || Date.now()) : state.live_started_at;
+    await db.prepare("UPDATE app_environment_state SET current_mode=?,live_started_at=?,updated_at=?,updated_by=? WHERE id=1")
+      .bind(target,liveStartedAt || null,Date.now(),actor || "owner").run();
+    return { changed:true, mode:target, liveStartedAt:liveStartedAt || null };
+  } catch (e) {
+    try {
+      await clearEnvironmentTables(db);
+      await restoreEnvironment(db,current);
+      await db.prepare("UPDATE app_environment_state SET current_mode=?,updated_at=?,updated_by=? WHERE id=1")
+        .bind(current,Date.now(),"automatic recovery").run();
+    } catch (rollbackError) {}
+    throw e;
+  }
+}
+
+async function ensureCustomerPortalTables(db){
+  await db.prepare(`CREATE TABLE IF NOT EXISTS customer_portal_tokens (phone TEXT PRIMARY KEY,token TEXT NOT NULL UNIQUE,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL)`).run();
+}
+async function getOrCreateCustomerPortalToken(db,phone){
+  await ensureCustomerPortalTables(db);let row=await db.prepare("SELECT token FROM customer_portal_tokens WHERE phone=?").bind(phone).first();if(row)return row.token;
+  const token=crypto.randomUUID()+crypto.randomUUID();await db.prepare("INSERT INTO customer_portal_tokens (phone,token,created_at,updated_at) VALUES (?,?,?,?)").bind(phone,token,Date.now(),Date.now()).run();return token;
+}
 async function ensureCrewProfilesTable(db) {
   await db.prepare(`CREATE TABLE IF NOT EXISTS crew_profiles (
     user_id INTEGER PRIMARY KEY,
@@ -240,9 +393,13 @@ async function ensureCrewProfilesTable(db) {
     emergency_name TEXT NOT NULL DEFAULT '',
     emergency_phone TEXT NOT NULL DEFAULT '',
     photo_updated_at INTEGER,
+    profile_completed_at INTEGER,
+    profile_icon TEXT NOT NULL DEFAULT 'gunner',
     updated_at INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (user_id) REFERENCES users(id)
   )`).run();
+  try { await db.prepare("ALTER TABLE crew_profiles ADD COLUMN profile_completed_at INTEGER").run(); } catch (e) {}
+  try { await db.prepare("ALTER TABLE crew_profiles ADD COLUMN profile_icon TEXT NOT NULL DEFAULT 'gunner'").run(); } catch (e) {}
 }
 
 
@@ -417,11 +574,16 @@ export default {
 
         const salt = crypto.randomUUID();
         const hash = await hashPassword(password, salt);
-        await db.prepare(
+        const created = await db.prepare(
           "INSERT INTO users (username, password_hash, role, name, created_at) VALUES (?, ?, ?, ?, ?)"
         ).bind(username, `${salt}:${hash}`, accountRole, name || username, Date.now()).run();
+        await ensureCrewProfilesTable(db);
+        const profileIcon = crypto.getRandomValues(new Uint8Array(1))[0] % 2 === 0 ? "gunner" : "leo";
+        await db.prepare(
+          "INSERT OR IGNORE INTO crew_profiles (user_id, profile_icon, updated_at) VALUES (?, ?, ?)"
+        ).bind(created.meta.last_row_id, profileIcon, Date.now()).run();
 
-        return jsonResponse({ success: true, username, role: accountRole });
+        return jsonResponse({ success: true, username, role: accountRole, profileIcon });
       }
 
       if (path === "/api/auth/users" && request.method === "GET") {
@@ -612,10 +774,41 @@ export default {
         });
       }
 
+      // ================= PUBLIC CUSTOMER PAGE =================
+      const customerPortalMatch=path.match(/^\/api\/customer-portal\/([^/]+)$/);
+      if(customerPortalMatch&&request.method==="GET"){
+        await ensureCustomerPortalTables(db);const token=decodeURIComponent(customerPortalMatch[1]),link=await db.prepare("SELECT phone FROM customer_portal_tokens WHERE token=?").bind(token).first();if(!link)return errorResponse("Customer page link not found.",404);
+        const profile=await db.prepare("SELECT phone,name,address FROM customer_profiles WHERE phone=?").bind(link.phone).first();if(!profile)return errorResponse("Customer profile not found.",404);
+        const plan=await db.prepare("SELECT plan,fee_waived FROM customer_plans WHERE phone=?").bind(link.phone).first();
+        const {results:appointments}=await db.prepare("SELECT date_iso,slot_label,start_ms,confirmed,notes FROM appointments WHERE phone=? AND start_ms>=? ORDER BY start_ms ASC LIMIT 12").bind(link.phone,Date.now()-86400000).all();
+        const {results:history}=await db.prepare("SELECT timestamp,total,lines FROM estimates WHERE phone=? AND status='completed' ORDER BY timestamp DESC LIMIT 20").bind(link.phone).all();
+        return jsonResponse({customer:{name:profile.name||"Customer",address:profile.address||""},plan:plan?{plan:plan.plan||"basic",feeWaived:!!plan.fee_waived}:{plan:"basic",feeWaived:false},appointments:appointments||[],history:(history||[]).map(h=>({timestamp:h.timestamp,total:h.total||0,lines:(()=>{try{return JSON.parse(h.lines||"[]")}catch(e){return[]}})()}))});
+      }
+
       // ================= EVERYTHING BELOW REQUIRES LOGIN =================
 
       const user = await getUserFromToken(db, getToken(request));
       if (!user) return errorResponse("Not logged in.", 401);
+
+      if (path === "/api/app-mode" && request.method === "GET") {
+        const state = await currentAppMode(db);
+        return jsonResponse({ mode: state.current_mode === "live" ? "live" : "beta", liveStartedAt: state.live_started_at || null, updatedAt: state.updated_at || null, updatedBy: state.updated_by || null });
+      }
+      if (path === "/api/app-mode" && request.method === "POST") {
+        if (user.role !== "owner") return errorResponse("Owner access only.",403);
+        const body = await request.json().catch(()=>({}));
+        const target = body.mode === "live" ? "live" : body.mode === "beta" ? "beta" : null;
+        if (!target) return errorResponse("Mode must be beta or live.");
+        if (target === "live" && String(body.confirm || "") !== "GO LIVE") return errorResponse("Type GO LIVE to confirm.",400);
+        if (target === "beta" && String(body.confirm || "") !== "OPEN BETA") return errorResponse("Type OPEN BETA to confirm.",400);
+        try {
+          const result = await switchAppEnvironment(db,target,user.name || user.username);
+          return jsonResponse({ success:true, ...result });
+        } catch (e) {
+          console.error("[APP MODE] switch failed", e);
+          return errorResponse("The workspace switch failed. The app attempted to restore the previous workspace.",500);
+        }
+      }
 
       if (OWNER_ONLY_PREFIXES.some((p) => path.startsWith(p)) && user.role !== "owner") {
         return errorResponse("Owner access only.", 403);
@@ -662,6 +855,42 @@ export default {
         const endpoint = String(body.endpoint || "").trim();
         if (endpoint) await db.prepare("DELETE FROM web_push_subscriptions WHERE endpoint = ? AND user_id = ?").bind(endpoint, user.id).run();
         return jsonResponse({ success: true });
+      }
+
+      // ================= TEAM CHAT =================
+      if (path === "/api/team-chat/people" && request.method === "GET") {
+        await ensureCrewProfilesTable(db);
+        const {results}=await db.prepare(`SELECT u.id,u.name,u.role,cp.photo_updated_at,COALESCE(cp.profile_icon,'gunner') AS profile_icon FROM users u LEFT JOIN crew_profiles cp ON cp.user_id=u.id WHERE u.disabled=0 ORDER BY CASE u.role WHEN 'owner' THEN 0 WHEN 'manager' THEN 1 ELSE 2 END,u.name,u.id`).all();
+        return jsonResponse({people:(results||[]).map(r=>({id:r.id,name:r.name||"Team Member",role:r.role,profileIcon:r.profile_icon||"gunner",photoUpdatedAt:r.photo_updated_at||null,isSelf:r.id===user.id}))});
+      }
+      const chatAvatarMatch=path.match(/^\/api\/team-chat\/avatar\/(\d+)$/);
+      if(chatAvatarMatch&&request.method==="GET"){
+        const targetId=Number(chatAvatarMatch[1]),target=await db.prepare("SELECT id FROM users WHERE id=? AND disabled=0").bind(targetId).first();
+        if(!target)return errorResponse("Team member not found.",404);
+        const photos=(env.PHOTOS||env.JOB_PHOTOS); if(!photos)return errorResponse("Photo storage unavailable.",404);
+        const obj=await photos.get(`profiles/${targetId}.jpg`); if(!obj)return errorResponse("Profile photo not found.",404);
+        return new Response(obj.body,{headers:{"Content-Type":(obj.httpMetadata&&obj.httpMetadata.contentType)||"image/jpeg","Cache-Control":"private, max-age=3600","Access-Control-Allow-Origin":"*"}});
+      }
+      if(path==="/api/team-chat/messages"&&request.method==="GET"){
+        await ensureTeamChatTables(db);await ensureCrewProfilesTable(db);
+        const room=String(url.searchParams.get("room")||"crew"),recipientId=Number(url.searchParams.get("userId")||0),roomKey=chatRoomKey(user,room,recipientId);
+        if(!roomKey)return errorResponse("That chat room is not available.",403);
+        if(room==="direct"&&!(await db.prepare("SELECT id FROM users WHERE id=? AND disabled=0").bind(recipientId).first()))return errorResponse("Team member not found.",404);
+        const {results}=await db.prepare(`SELECT m.id,m.sender_user_id,m.message,m.created_at,u.name,u.role,cp.photo_updated_at,COALESCE(cp.profile_icon,'gunner') AS profile_icon FROM team_chat_messages m JOIN users u ON u.id=m.sender_user_id LEFT JOIN crew_profiles cp ON cp.user_id=u.id WHERE m.room_key=? ORDER BY m.created_at ASC LIMIT 150`).bind(roomKey).all();
+        return jsonResponse({messages:(results||[]).map(m=>({id:m.id,senderId:m.sender_user_id,senderName:m.name||"Team Member",senderRole:m.role,profileIcon:m.profile_icon||"gunner",photoUpdatedAt:m.photo_updated_at||null,message:m.message,createdAt:m.created_at,isSelf:m.sender_user_id===user.id}))});
+      }
+      if(path==="/api/team-chat/messages"&&request.method==="POST"){
+        await ensureTeamChatTables(db);const body=await request.json().catch(()=>({})),room=String(body.room||"crew"),recipientId=Number(body.recipientId||0),roomKey=chatRoomKey(user,room,recipientId),message=String(body.message||"").trim().slice(0,1500);
+        if(!roomKey)return errorResponse("That chat room is not available.",403);if(!message)return errorResponse("Message is required.");
+        let notifyIds=[];
+        if(room==="crew"){const {results}=await db.prepare("SELECT id FROM users WHERE disabled=0 AND id<>?").bind(user.id).all();notifyIds=(results||[]).map(r=>r.id);}
+        else if(room==="management"){const {results}=await db.prepare("SELECT id FROM users WHERE disabled=0 AND role IN ('owner','manager') AND id<>?").bind(user.id).all();notifyIds=(results||[]).map(r=>r.id);}
+        else {const target=await db.prepare("SELECT id FROM users WHERE id=? AND disabled=0").bind(recipientId).first();if(!target)return errorResponse("Team member not found.",404);if(target.id!==user.id)notifyIds=[target.id];}
+        const id=crypto.randomUUID();await db.prepare("INSERT INTO team_chat_messages (id,room_key,sender_user_id,message,created_at) VALUES (?,?,?,?,?)").bind(id,roomKey,user.id,message,Date.now()).run();await pushUsers(db,notifyIds);return jsonResponse({success:true,id});
+      }
+      if(path==="/api/team-chat/read"&&request.method==="POST"){
+        await ensureTeamChatTables(db);const body=await request.json().catch(()=>({})),room=String(body.room||"crew"),recipientId=Number(body.recipientId||0),roomKey=chatRoomKey(user,room,recipientId);if(!roomKey)return errorResponse("That chat room is not available.",403);
+        await db.prepare(`INSERT INTO team_chat_reads (user_id,room_key,last_read_at) VALUES (?,?,?) ON CONFLICT(user_id,room_key) DO UPDATE SET last_read_at=excluded.last_read_at`).bind(user.id,roomKey,Date.now()).run();return jsonResponse({success:true});
       }
 
       // ================= TEAM NOTICES =================
@@ -746,6 +975,39 @@ export default {
         return jsonResponse({ success: true });
       }
 
+      // ================= PROFILE ICON PRESETS =================
+      if (path === "/api/profile-icons/team" && request.method === "GET") {
+        if (user.role !== "owner") return errorResponse("Owner access only.", 403);
+        await ensureCrewProfilesTable(db);
+        const { results } = await db.prepare(`
+          SELECT u.id, u.name, u.role, COALESCE(cp.profile_icon, 'gunner') AS profile_icon
+          FROM users u
+          LEFT JOIN crew_profiles cp ON cp.user_id = u.id
+          WHERE u.disabled = 0
+          ORDER BY CASE u.role WHEN 'owner' THEN 0 WHEN 'manager' THEN 1 ELSE 2 END, u.name, u.id
+        `).all();
+        return jsonResponse({ members: (results || []).map((r) => ({
+          id: r.id, name: r.name || "Team Member", role: r.role, profileIcon: r.profile_icon || "gunner"
+        })) });
+      }
+
+      const profileIconMatch = path.match(/^\/api\/profile-icons\/(\d+)$/);
+      if (profileIconMatch && request.method === "POST") {
+        if (user.role !== "owner") return errorResponse("Owner access only.", 403);
+        await ensureCrewProfilesTable(db);
+        const targetId = Number(profileIconMatch[1]);
+        const body = await request.json().catch(() => ({}));
+        const profileIcon = String(body.profileIcon || "").toLowerCase();
+        if (!["gunner", "leo"].includes(profileIcon)) return errorResponse("Choose Gunner or Leo.", 400);
+        const target = await db.prepare("SELECT id FROM users WHERE id = ? AND disabled = 0").bind(targetId).first();
+        if (!target) return errorResponse("Team member not found.", 404);
+        await db.prepare(`
+          INSERT INTO crew_profiles (user_id, profile_icon, updated_at) VALUES (?, ?, ?)
+          ON CONFLICT(user_id) DO UPDATE SET profile_icon = excluded.profile_icon, updated_at = excluded.updated_at
+        `).bind(targetId, profileIcon, Date.now()).run();
+        return jsonResponse({ success: true, profileIcon });
+      }
+
       // ================= CREW PROFILES =================
       // Basic work profile details are visible to signed-in team members.
       // Personal contact/address/emergency information is server-protected and only
@@ -755,7 +1017,8 @@ export default {
         const { results } = await db.prepare(`
           SELECT u.username, u.name, u.role, u.disabled,
                  COALESCE(cp.bio, '') AS bio,
-                 cp.photo_updated_at
+                 cp.photo_updated_at,
+                 COALESCE(cp.profile_icon, 'gunner') AS profile_icon
           FROM users u
           LEFT JOIN crew_profiles cp ON cp.user_id = u.id
           WHERE u.disabled = 0
@@ -766,6 +1029,7 @@ export default {
           role: r.role,
           bio: r.bio || "",
           photoUpdatedAt: r.photo_updated_at || null,
+          profileIcon: r.profile_icon || "gunner",
           profileKey: r.username === user.username ? "__me__" : `member:${r.username}`,
           isSelf: r.username === user.username,
         }));
@@ -777,11 +1041,11 @@ export default {
         const targetUsername = resolveProfileTargetParam(crewProfilePhotoMatch[1], user.username);
         const target = await db.prepare("SELECT id, username FROM users WHERE username = ? AND disabled = 0").bind(targetUsername).first();
         if (!target) return errorResponse("No active team member with that username.", 404);
-        if (!env.PHOTOS) return errorResponse("Profile photo storage isn't connected yet.", 500);
+        if (!(env.PHOTOS || env.JOB_PHOTOS)) return errorResponse("Profile photo storage isn't connected yet.", 500);
         const key = `profiles/${target.id}.jpg`;
 
         if (request.method === "GET") {
-          const obj = await env.PHOTOS.get(key);
+          const obj = await (env.PHOTOS || env.JOB_PHOTOS).get(key);
           if (!obj) return errorResponse("Profile photo not found.", 404);
           return new Response(obj.body, { headers: {
             "Content-Type": (obj.httpMetadata && obj.httpMetadata.contentType) || "image/jpeg",
@@ -798,17 +1062,17 @@ export default {
           if (!m) return errorResponse("Expected a JPEG, PNG, or WebP image.");
           const bytes = Uint8Array.from(atob(m[2]), (c) => c.charCodeAt(0));
           if (bytes.length > 5 * 1024 * 1024) return errorResponse("Profile photo is too large (5MB max).");
-          await env.PHOTOS.put(key, bytes, { httpMetadata: { contentType: m[1] }, customMetadata: { uploadedBy: user.username } });
+          await (env.PHOTOS || env.JOB_PHOTOS).put(key, bytes, { httpMetadata: { contentType: m[1] }, customMetadata: { uploadedBy: user.username } });
           await ensureCrewProfilesTable(db);
           await db.prepare(`
-            INSERT INTO crew_profiles (user_id, photo_updated_at, updated_at) VALUES (?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET photo_updated_at = excluded.photo_updated_at, updated_at = excluded.updated_at
+            INSERT INTO crew_profiles (user_id, photo_updated_at, profile_icon, updated_at) VALUES (?, ?, 'photo', ?)
+            ON CONFLICT(user_id) DO UPDATE SET photo_updated_at = excluded.photo_updated_at, profile_icon = 'photo', updated_at = excluded.updated_at
           `).bind(user.id, Date.now(), Date.now()).run();
           return jsonResponse({ success: true });
         }
 
         if (request.method === "DELETE") {
-          await env.PHOTOS.delete(key);
+          await (env.PHOTOS || env.JOB_PHOTOS).delete(key);
           await ensureCrewProfilesTable(db);
           await db.prepare(`
             INSERT INTO crew_profiles (user_id, photo_updated_at, updated_at) VALUES (?, NULL, ?)
@@ -830,7 +1094,9 @@ export default {
                  COALESCE(cp.address, '') AS address,
                  COALESCE(cp.emergency_name, '') AS emergency_name,
                  COALESCE(cp.emergency_phone, '') AS emergency_phone,
-                 cp.photo_updated_at
+                 cp.photo_updated_at,
+                 cp.profile_completed_at,
+                 COALESCE(cp.profile_icon, 'gunner') AS profile_icon
           FROM users u
           LEFT JOIN crew_profiles cp ON cp.user_id = u.id
           WHERE u.username = ? AND u.disabled = 0
@@ -844,6 +1110,8 @@ export default {
             role: target.role,
             bio: target.bio,
             photoUpdatedAt: target.photo_updated_at || null,
+            profileComplete: !!target.profile_completed_at,
+            profileIcon: target.profile_icon || "gunner",
             canSeePrivate,
             isSelf: target.id === user.id,
           };
@@ -868,14 +1136,23 @@ export default {
           const address = cleanProfileText(data.address, 260);
           const emergencyName = cleanProfileText(data.emergencyName, 120);
           const emergencyPhone = cleanProfileText(data.emergencyPhone, 60);
+          const completeProfile = data.completeProfile === true;
+          const requestedIcon = String(data.profileIcon || "").toLowerCase();
+          const profileIcon = ["gunner", "leo", "photo"].includes(requestedIcon) ? requestedIcon : null;
+          const now = Date.now();
           await db.prepare(`
-            INSERT INTO crew_profiles (user_id, bio, phone, email, address, emergency_name, emergency_phone, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO crew_profiles (user_id, bio, phone, email, address, emergency_name, emergency_phone, profile_completed_at, profile_icon, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'gunner'), ?)
             ON CONFLICT(user_id) DO UPDATE SET
               bio = excluded.bio, phone = excluded.phone, email = excluded.email, address = excluded.address,
               emergency_name = excluded.emergency_name, emergency_phone = excluded.emergency_phone,
+              profile_completed_at = CASE WHEN excluded.profile_completed_at IS NOT NULL THEN excluded.profile_completed_at ELSE crew_profiles.profile_completed_at END,
+              profile_icon = CASE WHEN ? IS NOT NULL THEN ? ELSE crew_profiles.profile_icon END,
               updated_at = excluded.updated_at
-          `).bind(user.id, bio, phone, email, address, emergencyName, emergencyPhone, Date.now()).run();
+          `).bind(
+            user.id, bio, phone, email, address, emergencyName, emergencyPhone,
+            completeProfile ? now : null, profileIcon, now, profileIcon, profileIcon
+          ).run();
           return jsonResponse({ success: true });
         }
       }
@@ -969,6 +1246,63 @@ export default {
         if (user.role !== "owner") return errorResponse("Owner access only.", 403);
         const { results } = await db.prepare("SELECT id, username, requested_at, status FROM password_reset_requests WHERE status = 'pending' ORDER BY requested_at DESC").all();
         return jsonResponse({ requests: results || [] });
+      }
+
+      // ================= JOB RESPONSIBILITY ASSIGNMENTS =================
+      if (path === "/api/job-roles/people" && request.method === "GET") {
+        const dateISO = String(url.searchParams.get("dateISO") || "");
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(dateISO)) return errorResponse("dateISO is required.");
+        await ensureCrewScheduleBoardTables(db);
+        const weekStart = mondayISOFromDate(dateISO);
+        const { results } = await db.prepare("SELECT id,name,role FROM users WHERE disabled=0 ORDER BY CASE role WHEN 'owner' THEN 0 WHEN 'manager' THEN 1 ELSE 2 END,name,id").all();
+        const people=[];
+        for (const p of results || []) {
+          let working=null;
+          const row=await db.prepare("SELECT schedule_json FROM crew_schedule_weeks WHERE user_id=? AND week_start=?").bind(p.id,weekStart).first();
+          if(row){try{const s=JSON.parse(row.schedule_json||"{}");working=!!(s[dateISO]&&s[dateISO].working);}catch(e){}}
+          people.push({id:p.id,name:p.name||"Team Member",role:p.role,working});
+        }
+        return jsonResponse({people});
+      }
+
+      if (path === "/api/job-roles" && request.method === "GET") {
+        await ensureJobRoleTables(db);
+        const jobTimestamp=Number(url.searchParams.get("jobTimestamp")||0);
+        if(!jobTimestamp)return errorResponse("jobTimestamp is required.");
+        const row=await db.prepare("SELECT * FROM job_role_assignments WHERE job_timestamp=?").bind(jobTimestamp).first();
+        let record=null;
+        if(row){
+          let crewIds=[],assignments={};try{crewIds=JSON.parse(row.crew_ids_json||"[]")}catch(e){}try{assignments=JSON.parse(row.assignments_json||"{}")}catch(e){}
+          const people=[];
+          for(const id of crewIds){const p=await db.prepare("SELECT id,name,role FROM users WHERE id=?").bind(id).first();if(p)people.push({id:p.id,name:p.name||"Team Member",role:p.role});}
+          record={jobTimestamp:row.job_timestamp,bookingId:row.booking_id,dateISO:row.date_iso,crewIds,assignments,people,updatedAt:row.updated_at,updatedBy:row.updated_by};
+        }
+        const {results:hist}=await db.prepare("SELECT id,changed_at,changed_by FROM job_role_assignment_history WHERE job_timestamp=? ORDER BY changed_at DESC LIMIT 20").bind(jobTimestamp).all();
+        return jsonResponse({record,history:(hist||[]).map(h=>({id:h.id,changedAt:h.changed_at,changedBy:h.changed_by}))});
+      }
+
+      if (path === "/api/job-roles" && request.method === "POST") {
+        if(user.role!=="owner"&&user.role!=="manager")return errorResponse("Owner or manager access only.",403);
+        await ensureJobRoleTables(db);
+        const body=await request.json().catch(()=>({}));
+        const jobTimestamp=Number(body.jobTimestamp||0),bookingId=String(body.bookingId||"").slice(0,160),dateISO=String(body.dateISO||"");
+        if(!jobTimestamp)return errorResponse("jobTimestamp is required.");
+        const ids=[...new Set((Array.isArray(body.crewIds)?body.crewIds:[]).map(Number).filter(n=>Number.isInteger(n)&&n>0))].slice(0,3);
+        if(ids.length<1)return errorResponse("Choose at least one crew member.");
+        const valid=[];
+        for(const id of ids){const p=await db.prepare("SELECT id FROM users WHERE id=? AND disabled=0").bind(id).first();if(p)valid.push(id);}
+        if(valid.length!==ids.length)return errorResponse("One of the selected team members is unavailable.");
+        const assignments={};
+        for(const [key,raw] of Object.entries(body.assignments||{})){const uid=Number(raw);if(allowedJobRoleKey(key)&&valid.includes(uid))assignments[key]=uid;}
+        const existing=await db.prepare("SELECT * FROM job_role_assignments WHERE job_timestamp=?").bind(jobTimestamp).first();
+        if(existing){
+          await db.prepare("INSERT INTO job_role_assignment_history (id,job_timestamp,booking_id,date_iso,crew_ids_json,assignments_json,changed_at,changed_by) VALUES (?,?,?,?,?,?,?,?)")
+            .bind(crypto.randomUUID(),jobTimestamp,existing.booking_id,existing.date_iso,existing.crew_ids_json,existing.assignments_json,Date.now(),user.name||user.username).run();
+        }
+        await db.prepare(`INSERT INTO job_role_assignments (job_timestamp,booking_id,date_iso,crew_ids_json,assignments_json,updated_at,updated_by)
+          VALUES (?,?,?,?,?,?,?) ON CONFLICT(job_timestamp) DO UPDATE SET booking_id=excluded.booking_id,date_iso=excluded.date_iso,crew_ids_json=excluded.crew_ids_json,assignments_json=excluded.assignments_json,updated_at=excluded.updated_at,updated_by=excluded.updated_by`)
+          .bind(jobTimestamp,bookingId||null,dateISO||null,JSON.stringify(valid),JSON.stringify(assignments),Date.now(),user.name||user.username).run();
+        return jsonResponse({success:true});
       }
 
       // ================= TWO-WEEK CREW SCHEDULE BOARD =================
@@ -1286,6 +1620,13 @@ export default {
         return jsonResponse({ entries: results });
       }
 
+      const portalLinkMatch=path.match(/^\/api\/customers\/([^/]+)\/portal-link$/);
+      if(portalLinkMatch&&request.method==="POST"){
+        if(user.role!=="owner"&&user.role!=="manager")return errorResponse("Owner or manager access only.",403);
+        const phone=decodeURIComponent(portalLinkMatch[1]);if(!(await db.prepare("SELECT phone FROM customer_profiles WHERE phone=?").bind(phone).first()))return errorResponse("Customer not found.",404);
+        const token=await getOrCreateCustomerPortalToken(db,phone);return jsonResponse({success:true,token});
+      }
+
       // ---- Customer plans (Basic / Plus) and Plus fee waivers ----
       if (path === "/api/customer-plans" && request.method === "GET") {
         const { results } = await db.prepare("SELECT phone, plan, fee_waived, waived_by, waived_at, plus_since FROM customer_plans").all();
@@ -1299,8 +1640,8 @@ export default {
         const data = await request.json();
         if (planMatch[2] === "plan") {
           if (user.role !== "owner" && user.role !== "manager") return errorResponse("Only the owner or a manager can change a customer's plan.", 403);
-          const plan = data.plan === "plus" ? "plus" : data.plan === "basic" ? "basic" : null;
-          if (!plan) return errorResponse("Plan must be basic or plus.");
+          const plan = ["basic","plus","signature"].includes(data.plan) ? data.plan : null;
+          if (!plan) return errorResponse("Plan must be basic, plus, or signature.");
           const keepPlus = plan === "plus" && current && current.plan === "plus";
           await db.prepare(`
             INSERT INTO customer_plans (phone, plan, fee_waived, waived_by, waived_at, plus_since, updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -1345,10 +1686,30 @@ export default {
         }
       }
 
+      // Previous recurring visit's matching BEFORE shot, for live camera alignment.
+      const previousBeforeMatch = path.match(/^\/api\/jobs\/(\d+)\/previous-before\/([a-z0-9-]{1,40})$/);
+      if (previousBeforeMatch && request.method === "GET") {
+        if (!(env.PHOTOS || env.JOB_PHOTOS)) return errorResponse("Photo storage isn't connected yet.",500);
+        const ts=Number(previousBeforeMatch[1]),slot=previousBeforeMatch[2];
+        const current=await db.prepare("SELECT phone FROM estimates WHERE timestamp=?").bind(ts).first();
+        if(!current)return errorResponse("No job with that id.",404);
+        const prev=await db.prepare(`
+          SELECT jp.r2_key,jp.job_ts
+          FROM job_photos jp
+          JOIN estimates e ON e.timestamp=jp.job_ts
+          WHERE e.phone=? AND e.timestamp<? AND jp.phase='before' AND jp.slot=?
+          ORDER BY e.timestamp DESC LIMIT 1
+        `).bind(current.phone,ts,slot).first();
+        if(!prev)return errorResponse("No earlier matching before photo.",404);
+        const obj=await (env.PHOTOS || env.JOB_PHOTOS).get(prev.r2_key||`jobs/${prev.job_ts}/before/${slot}.jpg`);
+        if(!obj)return errorResponse("Previous photo file not found.",404);
+        return new Response(obj.body,{headers:{"Content-Type":(obj.httpMetadata&&obj.httpMetadata.contentType)||"image/jpeg","Cache-Control":"private, max-age=3600","Access-Control-Allow-Origin":"*","X-RDUBS-Previous-Job":String(prev.job_ts)}});
+      }
+
       // ---- Checklist photos for a job: /api/jobs/:ts/photos[/:phase/:slot] ----
       const jobPhotoMatch = path.match(/^\/api\/jobs\/(\d+)\/photos(?:\/(before|after|issue)\/([a-z0-9-]{1,40}))?$/);
       if (jobPhotoMatch) {
-        if (!env.PHOTOS) return errorResponse("Photo storage isn't connected yet (missing PHOTOS binding).", 500);
+        if (!(env.PHOTOS || env.JOB_PHOTOS)) return errorResponse("Photo storage isn't connected yet (missing PHOTOS binding).", 500);
         const [, ts, phase, slot] = jobPhotoMatch;
         const job = await db.prepare("SELECT phone FROM estimates WHERE timestamp = ?").bind(ts).first();
         if (!job) return errorResponse("No job with that id.", 404);
@@ -1357,7 +1718,7 @@ export default {
           if (request.method !== "GET") return errorResponse("Not found.", 404);
           const list = await getShotList(db, job.phone);
           const { results } = await db.prepare("SELECT phase, slot, label, note, uploaded_by, uploaded_at FROM job_photos WHERE job_ts = ? ORDER BY uploaded_at").bind(ts).all();
-          const legacy = { before: !!(await env.PHOTOS.head(`jobs/${ts}/before.jpg`)), after: !!(await env.PHOTOS.head(`jobs/${ts}/after.jpg`)) };
+          const legacy = { before: !!(await (env.PHOTOS || env.JOB_PHOTOS).head(`jobs/${ts}/before.jpg`)), after: !!(await (env.PHOTOS || env.JOB_PHOTOS).head(`jobs/${ts}/after.jpg`)) };
           return jsonResponse({ ...list, photos: results, legacy });
         }
 
@@ -1365,7 +1726,7 @@ export default {
         const existing = await db.prepare("SELECT uploaded_by FROM job_photos WHERE job_ts = ? AND phase = ? AND slot = ?").bind(ts, phase, slot).first();
 
         if (request.method === "GET") {
-          const obj = await env.PHOTOS.get(key);
+          const obj = await (env.PHOTOS || env.JOB_PHOTOS).get(key);
           if (!obj) return errorResponse("Photo not found.", 404);
           return new Response(obj.body, { headers: {
             "Content-Type": (obj.httpMetadata && obj.httpMetadata.contentType) || "image/jpeg",
@@ -1385,20 +1746,20 @@ export default {
           if (!m) return errorResponse("Expected a JPEG, PNG, or WebP image.");
           const bytes = Uint8Array.from(atob(m[2]), (c) => c.charCodeAt(0));
           if (bytes.length > 5 * 1024 * 1024) return errorResponse("Photo is too large (5MB max).");
-          await env.PHOTOS.put(key, bytes, { httpMetadata: { contentType: m[1] }, customMetadata: { uploadedBy: user.username } });
+          await (env.PHOTOS || env.JOB_PHOTOS).put(key, bytes, { httpMetadata: { contentType: m[1] }, customMetadata: { uploadedBy: user.username } });
           await db.prepare(`
             INSERT INTO job_photos (job_ts, phase, slot, label, note, r2_key, uploaded_by, uploaded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(job_ts, phase, slot) DO UPDATE SET label = excluded.label, note = excluded.note, uploaded_by = excluded.uploaded_by, uploaded_at = excluded.uploaded_at
           `).bind(ts, phase, slot, String(data.label || slot).slice(0, 60), String(data.note || "").slice(0, 300), key, user.username, Date.now()).run();
-          await recomputePhotoFlags(db, env.PHOTOS, ts);
+          await recomputePhotoFlags(db, (env.PHOTOS || env.JOB_PHOTOS), ts);
           return jsonResponse({ success: true });
         }
 
         if (request.method === "DELETE") {
           if (phase !== "after" && user.role !== "owner") return errorResponse("Only the owner can remove before photos or flagged issues.", 403);
-          await env.PHOTOS.delete(key);
+          await (env.PHOTOS || env.JOB_PHOTOS).delete(key);
           await db.prepare("DELETE FROM job_photos WHERE job_ts = ? AND phase = ? AND slot = ?").bind(ts, phase, slot).run();
-          await recomputePhotoFlags(db, env.PHOTOS, ts);
+          await recomputePhotoFlags(db, (env.PHOTOS || env.JOB_PHOTOS), ts);
           return jsonResponse({ success: true });
         }
       }
@@ -1409,7 +1770,7 @@ export default {
       // true unless the photo really exists.
       const photoMatch = path.match(/^\/api\/photos\/(\d+)\/(before|after)$/);
       if (photoMatch) {
-        if (!env.PHOTOS) return errorResponse("Photo storage isn't connected yet (missing PHOTOS binding).", 500);
+        if (!(env.PHOTOS || env.JOB_PHOTOS)) return errorResponse("Photo storage isn't connected yet (missing PHOTOS binding).", 500);
         const [, ts, kind] = photoMatch;
         const key = `jobs/${ts}/${kind}.jpg`;
         const flagCol = kind === "before" ? "has_before_photo" : "has_photo";
@@ -1417,7 +1778,7 @@ export default {
         if (!job) return errorResponse("No job with that id.", 404);
 
         if (request.method === "GET") {
-          const obj = await env.PHOTOS.get(key);
+          const obj = await (env.PHOTOS || env.JOB_PHOTOS).get(key);
           if (!obj) return errorResponse("Photo not found.", 404);
           return new Response(obj.body, { headers: {
             "Content-Type": (obj.httpMetadata && obj.httpMetadata.contentType) || "image/jpeg",
@@ -1428,7 +1789,7 @@ export default {
 
         if (request.method === "POST") {
           // Before-photos are accountability records: once one exists, only the owner can replace it.
-          if (kind === "before" && user.role !== "owner" && await env.PHOTOS.head(key)) {
+          if (kind === "before" && user.role !== "owner" && await (env.PHOTOS || env.JOB_PHOTOS).head(key)) {
             return errorResponse("A before-service photo is already on file. Only the owner can replace it.", 403);
           }
           const data = await request.json();
@@ -1436,14 +1797,14 @@ export default {
           if (!m) return errorResponse("Expected a JPEG, PNG, or WebP image.");
           const bytes = Uint8Array.from(atob(m[2]), (c) => c.charCodeAt(0));
           if (bytes.length > 5 * 1024 * 1024) return errorResponse("Photo is too large (5MB max).");
-          await env.PHOTOS.put(key, bytes, { httpMetadata: { contentType: m[1] }, customMetadata: { uploadedBy: user.username, uploadedAt: String(Date.now()) } });
+          await (env.PHOTOS || env.JOB_PHOTOS).put(key, bytes, { httpMetadata: { contentType: m[1] }, customMetadata: { uploadedBy: user.username, uploadedAt: String(Date.now()) } });
           await db.prepare(`UPDATE estimates SET ${flagCol} = 1 WHERE timestamp = ?`).bind(ts).run();
           return jsonResponse({ success: true });
         }
 
         if (request.method === "DELETE") {
           if (kind === "before" && user.role !== "owner") return errorResponse("Only the owner can remove a before-service photo.", 403);
-          await env.PHOTOS.delete(key);
+          await (env.PHOTOS || env.JOB_PHOTOS).delete(key);
           await db.prepare(`UPDATE estimates SET ${flagCol} = 0 WHERE timestamp = ?`).bind(ts).run();
           return jsonResponse({ success: true });
         }
