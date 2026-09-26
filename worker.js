@@ -330,6 +330,39 @@ async function recomputePhotoFlags(db, photos, ts) {
   await db.prepare("UPDATE estimates SET has_before_photo = ?, has_photo = ? WHERE timestamp = ?").bind(hasBefore ? 1 : 0, hasAfter ? 1 : 0, ts).run();
 }
 
+// ---- Owner/manager PINs + customer plans ----
+// PINs approve sensitive actions (like waiving a Plus fee). Each one belongs to one person,
+// every use and every failed attempt is logged to them, and 5 wrong tries lock it 15 minutes.
+function isWeakPin(pin) {
+  if (/^(\d)\1+$/.test(pin)) return true;                                   // 0000, 11111
+  return "01234567890".includes(pin) || "09876543210".includes(pin);        // 1234, 98765
+}
+async function logPin(db, action, actor, pinOwner, target, detail) {
+  await db.prepare("INSERT INTO pin_audit (id, created_at, action, actor, pin_owner, target, detail) VALUES (?, ?, ?, ?, ?, ?, ?)")
+    .bind(crypto.randomUUID(), Date.now(), action, actor || null, pinOwner || null, target || null, detail || null).run();
+}
+async function verifyApproverPin(db, approverUsername, pin, actorUsername, target) {
+  const a = await db.prepare("SELECT id, username, role, disabled, pin_hash, pin_failed_count, pin_locked_until FROM users WHERE username = ?").bind(String(approverUsername || "")).first();
+  if (!a || a.disabled || (a.role !== "owner" && a.role !== "manager")) return { ok: false, error: "Choose an owner or manager to approve this.", status: 400 };
+  if (!a.pin_hash) return { ok: false, error: "That person hasn't set a PIN yet.", status: 400 };
+  if (a.pin_locked_until && a.pin_locked_until > Date.now()) return { ok: false, error: "Too many wrong PINs. That PIN is locked for 15 minutes.", status: 429 };
+  const [salt, hash] = a.pin_hash.split(":");
+  if (!(await verifyPassword(String(pin || ""), salt, hash))) {
+    const fails = (a.pin_failed_count || 0) + 1;
+    const lock = fails >= 5 ? Date.now() + 15 * 60 * 1000 : null;
+    await db.prepare("UPDATE users SET pin_failed_count = ?, pin_locked_until = ? WHERE id = ?").bind(lock ? 0 : fails, lock, a.id).run();
+    await logPin(db, lock ? "pin_locked" : "pin_failed", actorUsername, a.username, target, lock ? "5 wrong PINs, locked for 15 minutes" : null);
+    return { ok: false, error: lock ? "Too many wrong PINs. That PIN is locked for 15 minutes." : "Wrong PIN.", status: lock ? 429 : 403 };
+  }
+  await db.prepare("UPDATE users SET pin_failed_count = 0, pin_locked_until = NULL WHERE id = ?").bind(a.id).run();
+  return { ok: true, approver: a.username };
+}
+async function needsPinFor(db, user) {
+  if (user.role !== "owner" && user.role !== "manager") return false;
+  const row = await db.prepare("SELECT pin_hash FROM users WHERE id = ?").bind(user.id).first();
+  return !(row && row.pin_hash);
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -549,7 +582,7 @@ export default {
           .bind(token, user.id, Date.now(), Date.now() + SESSION_DURATION_MS).run();
 
         const roleNotification = await getPendingRoleNotification(db, user.id);
-        return jsonResponse({ token, user: { username: user.username, role: user.role, name: user.name }, roleNotification });
+        return jsonResponse({ token, user: { username: user.username, role: user.role, name: user.name }, roleNotification, needsPin: await needsPinFor(db, user) });
       }
 
       if (path === "/api/auth/logout" && request.method === "POST") {
@@ -562,19 +595,19 @@ export default {
         const user = await getUserFromToken(db, getToken(request));
         if (!user) return errorResponse("Not logged in.", 401);
         const roleNotification = await getPendingRoleNotification(db, user.id);
-        return jsonResponse({ user, roleNotification });
+        return jsonResponse({ user, roleNotification, needsPin: await needsPinFor(db, user) });
       }
 
       // Public quick check of what's actually deployed — bump when routes change.
       if (path === "/api/version" && request.method === "GET") {
         return jsonResponse({
-          version: "2026-09-25-photo-checklists",
+          version: "2026-09-26-pins-plans",
           features: [
             "auth", "estimates", "completed-by", "bookings", "job-assignment", "bookings-bulk-reschedule",
             "appointments", "customer-profiles", "customers-change-phone", "expenses", "inventory-items",
             "time-logs", "availability", "bug-reports", "crew-schedules", "site-content", "deleted-customers",
             "auth-users-pause", "manager-role", "change-password", "reset-password", "forgot-password",
-            "role-notifications", "time-clock", "quote", "job-photos-r2", "photo-checklists", "crew-profiles", "emergency-logout", "team-notices", "crew-schedule-board", "web-push",
+            "role-notifications", "time-clock", "quote", "job-photos-r2", "photo-checklists", "crew-profiles", "schedule-board", "team-notices", "push", "emergency-logout", "role-change", "owner-manager-pins", "customer-plans", "fee-waiver", "pin-audit", "crew-profiles", "emergency-logout", "team-notices", "crew-schedule-board", "web-push",
           ],
         });
       }
@@ -888,6 +921,9 @@ export default {
         if (!newRole) return errorResponse("Role must be crew or manager.", 400);
         if (newRole === target.role) return jsonResponse({ success: true, role: newRole, changed: false });
         await db.prepare("UPDATE users SET role = ? WHERE id = ?").bind(newRole, target.id).run();
+        // A new role means a fresh PIN: promoted managers must set their own at next login; crew have none.
+        await db.prepare("UPDATE users SET pin_hash = NULL, pin_set_at = NULL, pin_disclaimer_at = NULL, pin_failed_count = 0, pin_locked_until = NULL WHERE id = ?").bind(target.id).run();
+        await logPin(db, "pin_cleared", user.username, target.username, null, `Role changed ${target.role} to ${newRole}`);
         try {
           await ensureRoleNotificationsTable(db);
           await db.prepare("UPDATE role_notifications SET acknowledged_at = ? WHERE user_id = ? AND acknowledged_at IS NULL")
@@ -1213,6 +1249,77 @@ export default {
           0, 0, completedBy ?? null
         ).run();
         return jsonResponse({ success: true });
+      }
+
+      // ---- Owner/manager PINs ----
+      if (path === "/api/auth/pin" && request.method === "POST") {
+        if (user.role !== "owner" && user.role !== "manager") return errorResponse("Only the owner and managers have PINs.", 403);
+        const data = await request.json();
+        if (!data.acceptedDisclaimer) return errorResponse("Please read and accept the PIN notice first.");
+        const pin = String(data.pin || "");
+        if (!/^\d{4,6}$/.test(pin)) return errorResponse("Your PIN must be 4 to 6 digits.");
+        if (isWeakPin(pin)) return errorResponse("That PIN is too easy to guess. Avoid repeats like 1111 and runs like 1234.");
+        const me = await db.prepare("SELECT password_hash FROM users WHERE id = ?").bind(user.id).first();
+        const [salt, hash] = me.password_hash.split(":");
+        if (!(await verifyPassword(String(data.password || ""), salt, hash))) return errorResponse("Your password is incorrect.", 401);
+        const pinSalt = crypto.randomUUID();
+        await db.prepare("UPDATE users SET pin_hash = ?, pin_set_at = ?, pin_disclaimer_at = ?, pin_failed_count = 0, pin_locked_until = NULL WHERE id = ?")
+          .bind(`${pinSalt}:${await hashPassword(pin, pinSalt)}`, Date.now(), Date.now(), user.id).run();
+        await logPin(db, "pin_set", user.username, user.username, null, "Accepted the PIN notice");
+        return jsonResponse({ success: true });
+      }
+      if (path.startsWith("/api/auth/users/") && path.endsWith("/clear-pin") && request.method === "POST") {
+        if (user.role !== "owner") return errorResponse("Only the owner can clear someone's PIN.", 403);
+        const target = await db.prepare("SELECT id, username FROM users WHERE username = ?").bind(decodeURIComponent(path.split("/api/auth/users/")[1].replace(/\/clear-pin$/, ""))).first();
+        if (!target) return errorResponse("No account with that username.", 404);
+        await db.prepare("UPDATE users SET pin_hash = NULL, pin_set_at = NULL, pin_disclaimer_at = NULL, pin_failed_count = 0, pin_locked_until = NULL WHERE id = ?").bind(target.id).run();
+        await logPin(db, "pin_cleared", user.username, target.username, null, "Cleared by the owner; a new PIN is required at next login");
+        return jsonResponse({ success: true });
+      }
+      if (path === "/api/approvers" && request.method === "GET") {
+        const { results } = await db.prepare("SELECT username, name, role FROM users WHERE role IN ('owner','manager') AND (disabled IS NULL OR disabled = 0) AND pin_hash IS NOT NULL ORDER BY role DESC, name").all();
+        return jsonResponse({ approvers: results });
+      }
+      if (path === "/api/pin-audit" && request.method === "GET") {
+        if (user.role !== "owner") return errorResponse("Owner access only.", 403);
+        const { results } = await db.prepare("SELECT * FROM pin_audit ORDER BY created_at DESC LIMIT 200").all();
+        return jsonResponse({ entries: results });
+      }
+
+      // ---- Customer plans (Basic / Plus) and Plus fee waivers ----
+      if (path === "/api/customer-plans" && request.method === "GET") {
+        const { results } = await db.prepare("SELECT phone, plan, fee_waived, waived_by, waived_at, plus_since FROM customer_plans").all();
+        return jsonResponse({ plans: results });
+      }
+      const planMatch = path.match(/^\/api\/customers\/([^/]+)\/(plan|fee-waiver)$/);
+      if (planMatch && request.method === "POST") {
+        const phone = decodeURIComponent(planMatch[1]);
+        if (!(await db.prepare("SELECT phone FROM customer_profiles WHERE phone = ?").bind(phone).first())) return errorResponse("No customer with that phone number.", 404);
+        const current = await db.prepare("SELECT * FROM customer_plans WHERE phone = ?").bind(phone).first();
+        const data = await request.json();
+        if (planMatch[2] === "plan") {
+          if (user.role !== "owner" && user.role !== "manager") return errorResponse("Only the owner or a manager can change a customer's plan.", 403);
+          const plan = data.plan === "plus" ? "plus" : data.plan === "basic" ? "basic" : null;
+          if (!plan) return errorResponse("Plan must be basic or plus.");
+          const keepPlus = plan === "plus" && current && current.plan === "plus";
+          await db.prepare(`
+            INSERT INTO customer_plans (phone, plan, fee_waived, waived_by, waived_at, plus_since, updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(phone) DO UPDATE SET plan = excluded.plan, fee_waived = excluded.fee_waived, waived_by = excluded.waived_by,
+              waived_at = excluded.waived_at, plus_since = excluded.plus_since, updated_by = excluded.updated_by, updated_at = excluded.updated_at
+          `).bind(phone, plan, keepPlus ? current.fee_waived : 0, keepPlus ? current.waived_by : null, keepPlus ? current.waived_at : null,
+            plan === "plus" ? (keepPlus ? current.plus_since : Date.now()) : null, user.username, Date.now()).run();
+          if (!current || current.plan !== plan) await logPin(db, "plan_changed", user.username, null, phone, `${current ? current.plan : "basic"} to ${plan}`);
+          return jsonResponse({ success: true, plan });
+        }
+        // Waiving (or restoring) the $5/month Plus fee always needs an owner or manager PIN.
+        if (!current || current.plan !== "plus") return errorResponse("Only Plus customers have the monthly fee.");
+        const waive = !!data.waive;
+        const check = await verifyApproverPin(db, data.approver, data.pin, user.username, phone);
+        if (!check.ok) return errorResponse(check.error, check.status || 403);
+        await db.prepare("UPDATE customer_plans SET fee_waived = ?, waived_by = ?, waived_at = ?, updated_by = ?, updated_at = ? WHERE phone = ?")
+          .bind(waive ? 1 : 0, waive ? check.approver : null, waive ? Date.now() : null, user.username, Date.now(), phone).run();
+        await logPin(db, waive ? "fee_waived" : "fee_restored", user.username, check.approver, phone, data.reason ? String(data.reason).slice(0, 200) : null);
+        return jsonResponse({ success: true, feeWaived: waive, approvedBy: check.approver });
       }
 
       // ---- Photo checklist settings (everyone can read; only the owner edits) ----
@@ -1626,6 +1733,7 @@ export default {
           await db.prepare("UPDATE estimates SET phone = ? WHERE phone = ?").bind(newPhone, oldPhone).run();
           await db.prepare("UPDATE bookings SET phone = ? WHERE phone = ?").bind(newPhone, oldPhone).run();
           await db.prepare("UPDATE photo_shot_lists SET scope = ? WHERE scope = ?").bind(`customer:${newPhone}`, `customer:${oldPhone}`).run();
+          await db.prepare("UPDATE customer_plans SET phone = ? WHERE phone = ?").bind(newPhone, oldPhone).run();
 
           const { results: appts } = await db.prepare("SELECT * FROM appointments WHERE phone = ?").bind(oldPhone).all();
           for (const a of appts) {
